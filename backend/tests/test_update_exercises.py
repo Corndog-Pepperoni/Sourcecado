@@ -16,6 +16,7 @@ import update_fixtures as fx  # noqa: E402
 from coworker import doctor, migrations  # noqa: E402
 from coworker.agent_run_repository import AgentRunRepository  # noqa: E402
 from coworker.update_channel import UpdateStage, UpdateStatus, apply_update, rollback  # noqa: E402
+from coworker.update_channel.apply import has_run_store  # noqa: E402
 from state_fixtures import build_legacy_state  # noqa: E402
 
 
@@ -30,7 +31,7 @@ def _versions(root: Path) -> dict[str, int | None]:
 def _update(install, artifact, seed, public, **kwargs):
     kwargs.setdefault("health_check", lambda _i: True)
     opened = None
-    if "runs" not in kwargs and (install.state_root / "agent_runs.db").exists():
+    if "runs" not in kwargs and has_run_store(install.state_root):
         opened = AgentRunRepository(install.state_root)
         kwargs["runs"] = opened
     kwargs.setdefault("runs", None)
@@ -95,7 +96,7 @@ def test_exercise_upgrade_from_the_prior_preview(tmp_path):
     assert outcome.status is UpdateStatus.APPLIED, outcome.reason
     assert fx.bundle_version(install.bundle_path) == "0.0.2"
     assert fx.bundle_version(install.previous_path) == "0.0.1"
-    assert "agent_runs_db" in outcome.migrated
+    assert "conversation_transcripts" in outcome.migrated
     assert outcome.backup_id is not None
     assert migrations.plan_migrations(install.state_root).pending == ()
 
@@ -124,7 +125,7 @@ def test_exercise_failed_update_restores_the_last_usable_version(tmp_path):
     # Doctor and the updater must not disagree about what is on this machine.
     report = doctor.diagnose(install.state_root)
     assert not report.blocked, [item.code for item in report.findings if item.blocking]
-    assert {item.store_id: item.status for item in report.stores}["agent_runs_db"] in {
+    assert {item.store_id: item.status for item in report.stores}["conversation_transcripts"] in {
         "pending",
         "current",
     }
@@ -151,7 +152,7 @@ def test_exercise_rollback_after_a_successful_update(tmp_path):
     assert fx.bundle_version(install.bundle_path) == "0.0.1"
     assert not install.previous_path.exists()
     assert _versions(install.state_root) == versions_before
-    assert "agent_runs_db" in reverted.restored
+    assert "conversation_transcripts" in reverted.restored
     assert not doctor.diagnose(install.state_root).blocked
 
 
