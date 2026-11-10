@@ -110,11 +110,6 @@ class BudgetedProvider:
     def tool_catalog_error(self) -> str | None:
         return self._tool_catalog_error
 
-    def bind_workspace(self, grant_id: str) -> None:
-        bind = getattr(self.provider, "bind_workspace", None)
-        if callable(bind):
-            bind(grant_id)
-
     def bind_people(self, people: Any) -> None:
         bind = getattr(self.provider, "bind_people", None)
         if callable(bind):
@@ -205,12 +200,8 @@ class ScenarioProvider:
         self._total_tokens = 0
         self._budget = variant.run_budget
         self.budget_error: str | None = None
-        self.workspace_grant_id: str | None = None
         self.environment_samples: list[list[str]] = []
         self.people: Any = None
-
-    def bind_workspace(self, grant_id: str) -> None:
-        self.workspace_grant_id = grant_id
 
     def bind_people(self, people: Any) -> None:
         self.people = people
@@ -224,10 +215,6 @@ class ScenarioProvider:
         return person
 
     def _arguments(self, value: Any) -> Any:
-        if value == "$EVAL_WORKSPACE_GRANT":
-            if self.workspace_grant_id is None:
-                raise RuntimeError("eval workspace grant is not bound")
-            return self.workspace_grant_id
         if isinstance(value, str) and value.startswith("$EVAL_PERSON:"):
             return str(self._person(value.split(":", 1)[1])["person_id"])
         if isinstance(value, str) and value.startswith("$EVAL_VERSION:"):
@@ -417,12 +404,14 @@ def _seed_people(
 EVAL_DATABASE_URL_ENV = "SOURCECADO_EVAL_DATABASE_URL"
 
 
-def _use_eval_database(database_url: str | None) -> None:
-    if database_url:
-        from coworker.pg_scratch import state_dir_resolver
+def _use_eval_database(database_url: str | None) -> db.Database | None:
+    if not database_url:
+        return None
+    from coworker.pg_scratch import state_dir_resolver
 
-        database = db.Database(database_url, max_size=2)
-        db.set_resolver(state_dir_resolver(database, database_url))
+    database = db.Database(database_url, max_size=2)
+    db.set_resolver(state_dir_resolver(database, database_url))
+    return database
 
 
 def _spawned_run(
@@ -437,8 +426,9 @@ def _spawned_run(
     nondeterministic: bool,
     judge: JudgeObservation | None,
 ) -> None:
+    database = None
     try:
-        _use_eval_database(database_url)
+        database = _use_eval_database(database_url)
         result = EvalRunner(Path(artifact_root))._run_local(
             scenario,
             variant,
@@ -457,6 +447,11 @@ def _spawned_run(
                 f"{type(exc).__name__}: eval child failed",
             )
         )
+    finally:
+        # Close the pool before the child exits, or its worker threads are
+        # torn down during interpreter shutdown and print an error.
+        if database is not None:
+            database.close()
 
 
 class EvalRunner:
@@ -593,9 +588,6 @@ class EvalRunner:
         )
         environment.store.create_session(session_id)
         _seed_people(environment, session_id, scenario.seed_people)
-        bind_workspace = getattr(provider, "bind_workspace", None)
-        if callable(bind_workspace):
-            bind_workspace(str(environment.workspace_grant["id"]))
         bind_people = getattr(provider, "bind_people", None)
         if callable(bind_people):
             bind_people(environment.people)
@@ -647,7 +639,6 @@ class EvalRunner:
                         "mcp": environment.connectors.mcp,
                         "people": environment.people,
                         "skills": environment.skills,
-                        "workspace_runtime": environment.workspace_runtime,
                         "actor": "assistant",
                     },
                     emit=emit,
@@ -845,7 +836,6 @@ class EvalRunner:
         artifacts = RunArtifacts(
             root=str(environment.root.resolve()),
             state_dir=str(environment.state_dir.resolve()),
-            workspace_dir=str(environment.workspace_dir.resolve()),
             conversation_jsonl=str(conversation_path.resolve()),
             events_jsonl=str(events_path.resolve()),
             telemetry_jsonl=str(telemetry_path.resolve()),
@@ -886,7 +876,6 @@ class EvalRunner:
                 "tool_sensitive_keys": tool_sensitive_keys,
                 "process_isolated": process_isolated,
                 "child_pid": os.getpid(),
-                "workspace_grant": dict(environment.workspace_grant),
             },
             artifacts=artifacts,
             run_contract=run_contract,
@@ -1076,79 +1065,6 @@ class EvalRunner:
                 ),
             )
         )
-        workspace_files: list[dict[str, Any]] = []
-        workspace_directories: list[str] = []
-        for path in sorted(environment.workspace_dir.rglob("*")):
-            relative = path.relative_to(environment.workspace_dir).as_posix()
-            if path.is_symlink():
-                workspace_files.append({"path": relative, "kind": "symlink"})
-                continue
-            if path.is_dir():
-                workspace_directories.append(relative)
-                continue
-            if not path.is_file():
-                continue
-            try:
-                content = path.read_text(encoding="utf-8")
-            except (OSError, UnicodeDecodeError):
-                workspace_files.append({"path": relative, "kind": "binary"})
-            else:
-                workspace_files.append({"path": relative, "content": content})
-        workspace_by_path = {str(item["path"]): item for item in workspace_files}
-        for expectation in scenario.expected_workspace_files:
-            content = workspace_by_path.get(expectation.path, {}).get("content")
-            checks.append(
-                InvariantResult(
-                    name=f"workspace:{expectation.path}",
-                    passed=content == expectation.content,
-                    detail=(
-                        f"expected {expectation.content!r}; got {content!r} at "
-                        f"{expectation.path!r}"
-                    ),
-                )
-            )
-        expected_workspace = {
-            item.path for item in scenario.expected_workspace_files
-        }
-        actual_workspace = set(workspace_by_path)
-        expected_directories = {
-            parent.as_posix()
-            for item in scenario.expected_workspace_files
-            for parent in Path(item.path).parents
-            if parent.as_posix() != "."
-        }
-        actual_directories = set(workspace_directories)
-        checks.append(
-            InvariantResult(
-                name="workspace_effect_set",
-                passed=(
-                    actual_workspace == expected_workspace
-                    and actual_directories == expected_directories
-                ),
-                detail=(
-                    f"expected files={sorted(expected_workspace)!r}; "
-                    f"actual files={sorted(actual_workspace)!r}; "
-                    f"expected directories={sorted(expected_directories)!r}; "
-                    f"actual directories={sorted(actual_directories)!r}"
-                ),
-            )
-        )
-        grant = environment.workspace_runtime.grants.require(
-            str(environment.workspace_grant["id"])
-        )
-        grant_confined = (
-            Path(str(grant["path"])).resolve()
-            == environment.workspace_dir.resolve()
-            and grant.get("access") == "read_write"
-            and grant.get("allow_shell") is False
-        )
-        checks.append(
-            InvariantResult(
-                name="workspace_confinement",
-                passed=grant_confined,
-                detail=f"run-local grant={grant!r}",
-            )
-        )
         gmail = environment.connectors.gmail
         drafts = tuple(
             (str(item.get("to") or ""), str(item.get("subject") or ""))
@@ -1187,8 +1103,6 @@ class EvalRunner:
         return {
             "people": people,
             "person_events": person_events,
-            "workspace_files": workspace_files,
-            "workspace_directories": workspace_directories,
             "gmail_drafts": [
                 {"to": to, "subject": subject} for to, subject in drafts
             ],

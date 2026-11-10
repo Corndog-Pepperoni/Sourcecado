@@ -16,7 +16,6 @@ started is not a test.
 
 from __future__ import annotations
 
-import sqlite3
 import sys
 from datetime import UTC, datetime
 from pathlib import Path
@@ -272,7 +271,7 @@ def test_a_pending_migration_is_backed_up_and_applied_by_the_registry(tmp_path):
     pending_before = {
         item.store_id for item in migrations.plan_migrations(install.state_root).pending
     }
-    assert "conversation_db" in pending_before
+    assert "agent_runs_db" in pending_before
 
     outcome = _apply(fx.document(artifact, seed), install, artifact, public)
 
@@ -316,23 +315,6 @@ def test_the_backup_is_created_before_anything_changes(tmp_path):
     assert outcome.status is UpdateStatus.APPLIED, outcome.reason
     assert order[0] == "backup"
     assert order.index("backup") < order.index("migrate") < order.index("health")
-
-
-def test_a_store_from_a_future_version_refuses_the_whole_update(tmp_path):
-    """The registry's own fail-closed rule, not a second opinion about it."""
-    seed, public, artifact, install = _prepare(tmp_path, state=build_legacy_state)
-    conn = sqlite3.connect(install.state_root / "club.db")
-    conn.execute("PRAGMA user_version = 99")
-    conn.commit()
-    conn.close()
-    assert migrations.plan_migrations(install.state_root).blocked
-
-    outcome = _apply(fx.document(artifact, seed), install, artifact, public)
-
-    assert outcome.stage is UpdateStage.COMPATIBILITY
-    assert outcome.status is UpdateStatus.REFUSED
-    assert "conversation_db" in outcome.reason or "conversation_db" in outcome.guidance
-    assert fx.bundle_version(install.bundle_path) == "0.0.1"
 
 
 # --- criterion 4: keep or restore the last usable version ----------------
@@ -432,7 +414,7 @@ def test_a_failed_migration_rolls_the_state_back_and_leaves_the_bundle_alone(
     def broken(root, *, plan=None, backup=None):
         return migrations.MigrationOutcome(
             backup_id=backup.backup_id if backup else None,
-            error="conversation_db: the step raised",
+            error="agent_runs_db: the step raised",
         )
 
     monkeypatch.setattr(migrations, "apply_migrations", broken)

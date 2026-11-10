@@ -342,20 +342,20 @@ def test_the_tool_call_budget_stops_a_run_mid_batch_and_names_what_was_queued(
 
 
 def test_the_elapsed_time_budget_stops_a_slow_run(tmp_path):
-    # The budget must outlast the run setup (it reads the people store in
-    # Postgres) and still be shorter than one slow model request.
-    provider = SourcingProvider(sleep_seconds=1.0)
+    # The budget leaves room for the store's database round trips before the
+    # first request; the provider is still slower than the whole budget.
+    provider = SourcingProvider(sleep_seconds=0.6)
     result, conv = _turn(
         tmp_path,
         provider=provider,
-        run_budget_policy=RunBudgetPolicy(elapsed_seconds=0.5),
+        run_budget_policy=RunBudgetPolicy(elapsed_seconds=0.3),
     )
 
     assert provider.requests >= 1, "the run never issued a model request"
     terminal = _terminal(conv)
     assert result["status"] == "stopped"
     assert terminal["run_budget"]["stopped_by"] == "elapsed_seconds"
-    assert terminal["run_budget"]["consumed"]["elapsed_seconds"] >= 0.5
+    assert terminal["run_budget"]["consumed"]["elapsed_seconds"] >= 0.3
 
 
 def test_the_input_token_budget_counts_only_what_the_provider_reported(tmp_path):

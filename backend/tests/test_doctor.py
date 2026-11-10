@@ -142,7 +142,7 @@ def test_an_old_schema_version_is_reported_with_its_proposed_upgrade(tmp_path):
     finding = _finding(report, "store.version_behind")
     assert finding.repair is Repair.AUTOMATIC
     upgrades = [item for item in report.proposed_repairs if item.action == "migration.apply"]
-    assert {item.store_id for item in upgrades} >= {"conversation_db"}
+    assert {item.store_id for item in upgrades} >= {"agent_runs_db"}
     assert any(item.record_count > 0 for item in upgrades)
 
 
@@ -184,91 +184,6 @@ def test_a_torn_line_in_the_middle_of_a_jsonl_file_is_review_required(tmp_path):
     assert _outside_backups(_tree_digest(root)) == _outside_backups(before)
 
 
-def test_a_corrupt_json_column_is_detected_and_is_review_required(tmp_path):
-    root = build_current_state(tmp_path / "state")
-    migrations.apply_migrations(root)
-    conn = _connect(root, "club.db")
-    conn.execute("UPDATE inbox SET arguments = 'not json at all'")
-    conn.commit()
-    conn.close()
-
-    finding = _finding(doctor.diagnose(root), "sqlite.corrupt_row")
-    assert finding.store_id == "conversation_db"
-    assert finding.repair is Repair.REVIEW_REQUIRED
-    assert finding.record_count == 1
-    assert any("inbox.arguments" in line for line in finding.detail)
-
-
-def test_a_corrupt_drive_ingestion_db_is_reported_and_never_repaired(tmp_path):
-    root = build_current_state(tmp_path / "state")
-    migrations.apply_migrations(root)
-    path = root / "drive_ingestion.db"
-    raw = bytearray(path.read_bytes())
-    raw[4096 : 4096 + 512] = b"\x00" * 512
-    path.write_bytes(bytes(raw))
-    before = _tree_digest(root)
-
-    report = doctor.diagnose(root)
-    assert {"sqlite.integrity", "store.unreadable"} & _checks(report)
-    assert report.healthy is False
-    assert report.blocked is True
-    assert all(
-        item.repair is not Repair.AUTOMATIC
-        for item in report.findings
-        if item.store_id == "drive_ingestion"
-    )
-
-    doctor.repair(root)
-    assert _outside_backups(_tree_digest(root)) == _outside_backups(before)
-
-
-def test_a_corrupt_meeting_evidence_db_is_reported_and_never_repaired(tmp_path):
-    root = build_current_state(tmp_path / "state")
-    migrations.apply_migrations(root)
-    path = root / "meeting_evidence.db"
-    raw = bytearray(path.read_bytes())
-    raw[4096 : 4096 + 512] = b"\x00" * 512
-    path.write_bytes(bytes(raw))
-    before = _tree_digest(root)
-
-    report = doctor.diagnose(root)
-    assert {"sqlite.integrity", "store.unreadable"} & _checks(report)
-    assert report.healthy is False
-    assert report.blocked is True
-    assert all(
-        item.repair is not Repair.AUTOMATIC
-        for item in report.findings
-        if item.store_id == "meeting_evidence"
-    )
-
-    doctor.repair(root)
-    assert _outside_backups(_tree_digest(root)) == _outside_backups(before)
-
-
-def test_a_file_that_is_not_a_database_blocks_every_repair(tmp_path):
-    root = build_current_state(tmp_path / "state")
-    (root / "club.db").write_bytes(b"this is not a sqlite file")
-    before = _tree_digest(root)
-
-    report = doctor.diagnose(root)
-    assert "store.unreadable" in _checks(report)
-    assert report.blocked is True
-    assert report.proposed_repairs == ()
-
-    outcome = doctor.repair(root)
-    assert outcome.applied_repairs == ()
-    assert _outside_backups(_tree_digest(root)) == _outside_backups(before)
-
-
-def test_an_unreadable_json_document_is_reported(tmp_path):
-    root = build_current_state(tmp_path / "state")
-    (root / "shell_tasks.json").write_text("{{{", encoding="utf-8")
-
-    report = doctor.diagnose(root)
-    assert "store.unreadable" in _checks(report)
-    assert report.blocked is True
-
-
 def test_an_event_record_at_an_unsupported_version_is_reported(tmp_path):
     root = build_current_state(tmp_path / "state")
     migrations.apply_migrations(root)
@@ -288,7 +203,7 @@ def test_an_event_record_at_an_unsupported_version_is_reported(tmp_path):
 def test_an_unknown_future_version_fails_closed_without_modifying_state(tmp_path):
     root = build_current_state(tmp_path / "state")
     migrations.apply_migrations(root)
-    conn = sqlite3.connect(root / "club.db")
+    conn = sqlite3.connect(root / "agent_runs.db")
     conn.execute("PRAGMA user_version = 99")
     conn.commit()
     conn.close()
@@ -310,60 +225,10 @@ def test_an_unknown_future_version_fails_closed_without_modifying_state(tmp_path
 # --- permissions, dependencies -------------------------------------------
 
 
-def test_doctor_inspects_drive_ingestion_db_when_present(tmp_path):
-    """A director who used Drive folder ingestion has drive_ingestion.db on disk.
-
-    Doctor, packaging, and later updates consume the registry, so a world-readable
-    copy of that database must show up as a named store with permission drift.
-    """
-    root = build_current_state(tmp_path / "state")
-    migrations.apply_migrations(root)
-    path = root / "drive_ingestion.db"
-    os.chmod(path, 0o666)
-
-    report = doctor.diagnose(root)
-
-    drive = next(item for item in report.stores if item.store_id == "drive_ingestion")
-    assert drive.present is True
-    assert drive.kind == "sqlite"
-    finding = _finding(report, "permissions.drift")
-    assert finding.repair is Repair.AUTOMATIC
-    assert any(
-        "drive_ingestion.db" in line and "0o666" in line for line in finding.detail
-    )
-    assert report.healthy is False
-    assert any(item.action == "permissions.tighten" for item in report.proposed_repairs)
-
-
-def test_doctor_inspects_meeting_evidence_db_when_present(tmp_path):
-    """Current main writes meeting_evidence.db on every backend start.
-
-    Doctor, packaging, and later updates consume the registry, so a world-readable
-    copy of that database must show up as a named store with permission drift.
-    """
-    root = build_current_state(tmp_path / "state")
-    migrations.apply_migrations(root)
-    path = root / "meeting_evidence.db"
-    os.chmod(path, 0o666)
-
-    report = doctor.diagnose(root)
-
-    meeting = next(item for item in report.stores if item.store_id == "meeting_evidence")
-    assert meeting.present is True
-    assert meeting.kind == "sqlite"
-    finding = _finding(report, "permissions.drift")
-    assert finding.repair is Repair.AUTOMATIC
-    assert any(
-        "meeting_evidence.db" in line and "0o666" in line for line in finding.detail
-    )
-    assert report.healthy is False
-    assert any(item.action == "permissions.tighten" for item in report.proposed_repairs)
-
-
 def test_unsafe_state_permissions_are_detected_and_repaired(tmp_path):
     root = build_current_state(tmp_path / "state")
     migrations.apply_migrations(root)
-    os.chmod(root / "club.db", 0o644)
+    os.chmod(root / "agent_runs.db", 0o644)
     os.chmod(root / "secrets.json", 0o666)
     os.chmod(root / "conversations", 0o755)
 
@@ -375,7 +240,7 @@ def test_unsafe_state_permissions_are_detected_and_repaired(tmp_path):
 
     after = doctor.repair(root)
     assert "permissions.tighten" in after.applied_repairs
-    assert oct((root / "club.db").stat().st_mode & 0o777) == "0o600"
+    assert oct((root / "agent_runs.db").stat().st_mode & 0o777) == "0o600"
     assert oct((root / "secrets.json").stat().st_mode & 0o777) == "0o600"
     assert oct((root / "conversations").stat().st_mode & 0o777) == "0o700"
     assert "permissions.drift" not in _checks(doctor.diagnose(root))
@@ -410,95 +275,12 @@ def test_present_dependencies_are_reported_without_a_finding(tmp_path):
 # --- schedule and orphaned links ----------------------------------------
 
 
-def test_schedule_inconsistencies_are_detected(tmp_path):
-    root = build_current_state(tmp_path / "state")
-    migrations.apply_migrations(root)
-    conn = _connect(root, "club.db")
-    conn.execute(
-        "INSERT INTO runs (job_id, status, result, session_id, artifacts) "
-        "VALUES (404, 'success', 'orphan', 'sched-404', '[]')"
-    )
-    conn.execute("UPDATE jobs SET next_run_at = 'not-a-timestamp' WHERE id = 1")
-    conn.execute(
-        "INSERT INTO runs (job_id, status, result, session_id, artifacts) "
-        "VALUES (1, 'banana', '', 'sched-1', '[]')"
-    )
-    conn.commit()
-    conn.close()
-
-    report = doctor.diagnose(root)
-    assert _finding(report, "schedule.orphaned_run").record_count == 1
-    assert _finding(report, "schedule.unparsable_next_run").record_count == 1
-    assert _finding(report, "schedule.unknown_run_status").record_count == 1
-    for check in (
-        "schedule.orphaned_run",
-        "schedule.unparsable_next_run",
-        "schedule.unknown_run_status",
-    ):
-        assert _finding(report, check).repair is Repair.REVIEW_REQUIRED
-
-
-def test_orphaned_queue_and_approval_links_are_detected(tmp_path):
-    root = build_current_state(tmp_path / "state")
-    migrations.apply_migrations(root)
-    conn = _connect(root, "club.db")
-    conn.execute(
-        "INSERT INTO chat_queue "
-        "(session_id, id, text, position, state, created_at, updated_at) "
-        "VALUES ('ghost', 'q1', 'stranded', 0, 'waiting', '2026-08-01', '2026-08-01')"
-    )
-    conn.execute(
-        "INSERT INTO inbox (id, kind, name, arguments, state, session_id) "
-        "VALUES ('call_ghost', 'approval', 'gmail_send', '{}', 'pending', 'ghost')"
-    )
-    conn.execute(
-        "INSERT INTO inbox (id, kind, name, arguments, state, original_call_id) "
-        "VALUES ('call_chained', 'approval', 'gmail_send', '{}', 'pending', 'call_missing')"
-    )
-    conn.commit()
-    conn.close()
-
-    report = doctor.diagnose(root)
-    assert _finding(report, "queue.orphaned_session").record_count == 1
-    assert _finding(report, "approval.orphaned_session").record_count == 1
-    assert _finding(report, "approval.orphaned_chain").record_count == 1
-    assert all(
-        item.repair is Repair.REVIEW_REQUIRED
-        for item in report.findings
-        if item.check.startswith(("queue.", "approval."))
-    )
-
-
-def test_an_interrupted_approval_is_reported_and_never_auto_repaired(tmp_path):
-    from coworker.store import ConversationStore
-
-    root = build_current_state(tmp_path / "state")
-    migrations.apply_migrations(root)
-    conn = _connect(root, "club.db")
-    conn.execute(
-        "UPDATE inbox SET state = 'resolved', decision = 'allow', "
-        "execution_status = 'executing' WHERE id = 'call_gmail_send_1'"
-    )
-    conn.commit()
-    conn.close()
-    # The restart reconciler is what turns a dead claim into an interrupted one.
-    ConversationStore(root)
-
-    report = doctor.diagnose(root)
-    finding = _finding(report, "approval.interrupted")
-    assert finding.repair is Repair.REVIEW_REQUIRED
-    assert finding.record_count == 1
-    assert all(
-        item.action != "approval" for item in report.proposed_repairs
-    )
-
-
 # --- dry run, repair, backup --------------------------------------------
 
 
 def test_dry_run_is_the_default_and_changes_nothing(tmp_path):
     root = build_legacy_state(tmp_path / "state")
-    os.chmod(root / "club.db", 0o644)
+    os.chmod(root / "agent_runs.db", 0o644)
     with (root / "conversations" / "main.jsonl").open("a", encoding="utf-8") as handle:
         handle.write('{"role": "user", "content": "tor')
     before = _tree_digest(root)
@@ -527,45 +309,16 @@ def test_repair_creates_a_timestamped_backup_before_changing_state(tmp_path):
     assert report.backup_id.startswith("doctor-")
     backup = root / migrations.BACKUPS_DIR_NAME / report.backup_id
     assert (backup / "manifest.json").is_file()
-    conn = sqlite3.connect(backup / "club.db")
+    conn = sqlite3.connect(backup / "agent_runs.db")
     try:
-        assert int(conn.execute("PRAGMA user_version").fetchone()[0]) == 0
-    finally:
-        conn.close()
-
-
-def test_only_deterministic_repairs_run_automatically(tmp_path):
-    root = build_current_state(tmp_path / "state")
-    migrations.apply_migrations(root)
-    conn = _connect(root, "club.db")
-    conn.execute("UPDATE inbox SET arguments = 'not json'")
-    conn.execute(
-        "INSERT INTO chat_queue "
-        "(session_id, id, text, position, state, created_at, updated_at) "
-        "VALUES ('ghost', 'q1', 'stranded', 0, 'waiting', '2026-08-01', '2026-08-01')"
-    )
-    conn.commit()
-    conn.close()
-    os.chmod(root / "club.db", 0o644)
-
-    report = doctor.repair(root)
-
-    assert report.applied_repairs == ("permissions.tighten",)
-    survivors = _checks(doctor.diagnose(root))
-    assert {"sqlite.corrupt_row", "queue.orphaned_session"} <= survivors
-    conn = _connect(root, "club.db")
-    try:
-        assert conn.execute("SELECT COUNT(*) FROM chat_queue").fetchone()[0] == 2
-        assert conn.execute(
-            "SELECT arguments FROM inbox WHERE id = 'call_gmail_send_1'"
-        ).fetchone()[0] == "not json"
+        assert int(conn.execute("PRAGMA user_version").fetchone()[0]) == 1
     finally:
         conn.close()
 
 
 def test_repair_is_idempotent(tmp_path):
     root = build_legacy_state(tmp_path / "state")
-    os.chmod(root / "club.db", 0o644)
+    os.chmod(root / "agent_runs.db", 0o644)
 
     first = doctor.repair(root)
     assert first.applied_repairs
@@ -579,10 +332,9 @@ def test_repair_is_idempotent(tmp_path):
 
 def test_state_is_usable_after_repair_and_a_restart(tmp_path):
     from coworker.store import ConversationStore
-    from coworker.workspace import WorkspaceGrantStore
 
     root = build_legacy_state(tmp_path / "state")
-    os.chmod(root / "club.db", 0o644)
+    os.chmod(root / "agent_runs.db", 0o644)
     with (root / "conversations" / "main.jsonl").open("a", encoding="utf-8") as handle:
         handle.write('{"role": "user", "content": "tor')
 
@@ -590,8 +342,6 @@ def test_state_is_usable_after_repair_and_a_restart(tmp_path):
 
     store = ConversationStore(root)
     assert len(store.load("main")) == 2
-    assert store.list_schedule()["jobs"][0]["template_id"] == "legacy"
-    assert len(WorkspaceGrantStore(root).list_all()) == 1
     assert doctor.diagnose(root).healthy is True
 
 
@@ -617,10 +367,10 @@ def test_backups_are_listed_for_inspection_and_restore(tmp_path):
     assert report.backup_id in {item["backup_id"] for item in listed}
 
     result = migrations.restore_backup(root, report.backup_id)
-    assert "conversation_db" in result["restored"]
-    conn = sqlite3.connect(root / "club.db")
+    assert "agent_runs_db" in result["restored"]
+    conn = sqlite3.connect(root / "agent_runs.db")
     try:
-        assert int(conn.execute("PRAGMA user_version").fetchone()[0]) == 0
+        assert int(conn.execute("PRAGMA user_version").fetchone()[0]) == 1
     finally:
         conn.close()
 
@@ -635,55 +385,28 @@ _DRIFT_ONLY_CARRIERS = (
     ".env",
     "memory/99.md",
     "mcp.json",
-    "workspace_grants.json",
-    "shell_tasks.json",
-    "host_command_approvals.json",
-    "directory_requests.json",
 )
 
 # Stores that produce a finding naming themselves.
 _SELF_REPORTING_CARRIERS = {
-    "conversation_db": "sqlite.corrupt_row",
     "conversation_transcripts": "jsonl.torn_tail",
     "presentation_events": "jsonl.record_version",
-    "workspace_receipts": "jsonl.torn_tail",
 }
 
 
-def _provoke_findings_in_every_store(root: Path, *, include_blocking: bool = True) -> None:
+def _provoke_findings_in_every_store(root: Path) -> None:
     """Give Doctor a reason to say something about each kind of store.
 
     A store Doctor stays silent about never puts its bytes near the output, so
     asserting "no secret leaked" from a silent store proves nothing. Each defect
     below drives a real finding on a store that is carrying a planted credential.
-
-    `include_blocking` adds an unreadable JSON document. That is a fail-closed
-    condition, so it stops every repair — callers testing the repair path must
-    leave it out or they will be testing a no-op.
     """
-    conn = _connect(root, "club.db")
-    conn.execute("UPDATE inbox SET arguments = ?", (f"authorization: Bearer {PLANTED_API_KEY}",))
-    conn.execute(
-        "INSERT INTO chat_queue "
-        "(session_id, id, text, position, state, created_at, updated_at) "
-        f"VALUES ('ghost', 'q1', 'send the key {PLANTED_API_KEY}', 0, 'waiting', 'x', 'x')"
-    )
-    conn.commit()
-    conn.close()
-    # JSONL directory and JSONL log: a crash-torn tail holding a credential.
+    # JSONL directory: a crash-torn tail holding a credential.
     with (root / "conversations" / "main.jsonl").open("a", encoding="utf-8") as handle:
         handle.write(json.dumps({"role": "user", "content": PLANTED_API_KEY})[:40])
-    with (root / "workspace_receipts.jsonl").open("a", encoding="utf-8") as handle:
-        handle.write('{"summary": "api_key=' + PLANTED_API_KEY + '", "tru')
     # JSONL directory again, on the record-version path.
     with (root / "events" / "main.jsonl").open("a", encoding="utf-8") as handle:
         handle.write(json.dumps({"version": 1, "type": "error", "message": PLANTED_BEARER}) + "\n")
-    if include_blocking:
-        # JSON document: unreadable, so the parse error itself must stay clean.
-        (root / "shell_tasks.json").write_text(
-            '{"version": 1, "tasks": [{"command_summary": "' + PLANTED_BEARER + '"',
-            encoding="utf-8",
-        )
     for name in _DRIFT_ONLY_CARRIERS:
         os.chmod(root / name, 0o644)
 
@@ -700,20 +423,15 @@ def test_every_store_kind_holds_a_planted_secret(tmp_path):
     root = build_current_state(tmp_path / "state", plant_secrets=True)
 
     carriers = {
-        migrations.StoreKind.SQLITE: ["club.db"],
         migrations.StoreKind.JSONL_DIR: ["conversations/main.jsonl", "events/main.jsonl"],
-        migrations.StoreKind.JSONL_LOG: ["workspace_receipts.jsonl"],
-        migrations.StoreKind.JSON_DOCUMENT: [
-            "workspace_grants.json",
-            "shell_tasks.json",
-            "host_command_approvals.json",
-            "directory_requests.json",
-            "mcp.json",
-        ],
+        migrations.StoreKind.JSON_DOCUMENT: ["mcp.json"],
         migrations.StoreKind.OPAQUE_FILE: ["secrets.json", ".env"],
         migrations.StoreKind.DIRECTORY: ["memory/99.md"],
     }
-    assert set(carriers) == {spec.kind for spec in migrations.REGISTRY}
+    # The run store carries no planted credential, so SQLITE has no carrier here.
+    assert set(carriers) == {
+        spec.kind for spec in migrations.REGISTRY if spec.kind is not migrations.StoreKind.SQLITE
+    }
     _provoke_findings_in_every_store(root)
     for kind, names in carriers.items():
         for name in names:
@@ -735,7 +453,6 @@ def test_no_planted_secret_survives_into_doctor_output(tmp_path):
         assert any(
             item.store_id == store_id and item.check == check for item in report.findings
         ), (store_id, check, sorted((i.store_id, i.check) for i in report.findings))
-    assert any(item.store_id == "shell_tasks" for item in report.findings)
 
     _assert_no_canary([rendered, serialized], "diagnose")
 
@@ -743,9 +460,9 @@ def test_no_planted_secret_survives_into_doctor_output(tmp_path):
 def test_no_planted_secret_survives_from_a_drift_only_store(tmp_path):
     """The stores with no content check of their own reach the report only
     through a permissions finding, whose detail list is capped. Prove coverage
-    in batches that fit under the cap, rather than assuming all eight fit."""
+    in batches that fit under the cap, rather than assuming they all fit."""
     root = build_current_state(tmp_path / "state", plant_secrets=True)
-    _provoke_findings_in_every_store(root, include_blocking=False)
+    _provoke_findings_in_every_store(root)
 
     batch = doctor.MAX_DETAIL_ROWS - 2
     covered = set()
@@ -772,9 +489,7 @@ def test_no_planted_secret_survives_from_a_drift_only_store(tmp_path):
 def test_no_planted_secret_survives_a_repair_or_its_report(tmp_path):
     """The repair path renders a second report and writes a manifest and backups."""
     root = build_current_state(tmp_path / "state", plant_secrets=True)
-    # No blocking defect: a fail-closed report makes repair a no-op, and this
-    # test would then prove nothing about the repair path.
-    _provoke_findings_in_every_store(root, include_blocking=False)
+    _provoke_findings_in_every_store(root)
 
     report = doctor.repair(root)
 
@@ -789,7 +504,7 @@ def test_no_planted_secret_survives_a_repair_or_its_report(tmp_path):
     manifests = sorted((root / migrations.BACKUPS_DIR_NAME).rglob("manifest.json"))
     assert len(manifests) == 1
     backup = root / migrations.BACKUPS_DIR_NAME / report.backup_id
-    assert (backup / "club.db").is_file()
+    assert (backup / "agent_runs.db").is_file()
     assert (backup / "conversations" / "main.jsonl").is_file()
 
     texts = [report.render(), json.dumps(report.to_dict())]
@@ -836,41 +551,9 @@ def test_redact_strips_credentials_without_mangling_identifiers(tmp_path):
     assert len(doctor.redact("x" * 5000, root)) <= doctor.MAX_DETAIL_CHARS
 
 
-def test_a_secret_in_an_identifier_field_is_redacted_from_the_report(tmp_path):
-    """Session ids and run statuses are printed verbatim, so they need the
-    backstop. This drives a credential through both."""
-    root = build_current_state(tmp_path / "state")
-    migrations.apply_migrations(root)
-    conn = _connect(root, "club.db")
-    conn.execute(
-        "INSERT INTO chat_queue "
-        "(session_id, id, text, position, state, created_at, updated_at) "
-        "VALUES (?, 'q1', 'stranded', 0, 'waiting', 'x', 'x')",
-        (PLANTED_API_KEY,),
-    )
-    conn.execute(
-        "INSERT INTO runs (job_id, status, result, session_id, artifacts) "
-        "VALUES (1, ?, '', 'sched-1', '[]')",
-        (PLANTED_BEARER,),
-    )
-    conn.commit()
-    conn.close()
-
-    report = doctor.diagnose(root)
-    rendered = report.render()
-    serialized = json.dumps(report.to_dict())
-
-    # The findings fired, so the identifiers really did reach the report.
-    assert _finding(report, "queue.orphaned_session").record_count == 1
-    assert _finding(report, "schedule.unknown_run_status").record_count == 1
-    assert PLANTED_API_KEY not in rendered and PLANTED_API_KEY not in serialized
-    assert PLANTED_BEARER not in rendered and PLANTED_BEARER not in serialized
-    assert "[redacted]" in rendered
-
-
 def test_no_secret_survives_a_repair_backup_manifest(tmp_path):
     root = build_current_state(tmp_path / "state", plant_secrets=True)
-    os.chmod(root / "club.db", 0o644)
+    os.chmod(root / "agent_runs.db", 0o644)
 
     report = doctor.repair(root)
     manifest = (
@@ -884,7 +567,7 @@ def test_no_secret_survives_a_repair_backup_manifest(tmp_path):
 
 def test_output_carries_no_absolute_path(tmp_path):
     root = build_current_state(tmp_path / "state", plant_secrets=True)
-    os.chmod(root / "club.db", 0o644)
+    os.chmod(root / "agent_runs.db", 0o644)
     with (root / "conversations" / "main.jsonl").open("a", encoding="utf-8") as handle:
         handle.write('{"role": "user", "content": "tor')
 
@@ -935,19 +618,10 @@ def test_cli_check_is_the_default_and_reports_health_by_exit_code(tmp_path, caps
     assert doctor.main(["--state", str(root)]) == 0
     capsys.readouterr()
 
-    os.chmod(root / "club.db", 0o644)
+    os.chmod(root / "agent_runs.db", 0o644)
     before = _tree_digest(root)
     assert doctor.main(["--state", str(root)]) == 1
     assert _tree_digest(root) == before
-
-
-def test_cli_blocks_with_a_distinct_exit_code(tmp_path, capsys):
-    root = build_current_state(tmp_path / "state")
-    (root / "club.db").write_bytes(b"not a database")
-
-    assert doctor.main(["--state", str(root)]) == 2
-    assert doctor.main(["repair", "--state", str(root)]) == 2
-    capsys.readouterr()
 
 
 def test_cli_repair_applies_safe_repairs_and_prints_the_backup_id(tmp_path, capsys):
@@ -980,9 +654,9 @@ def test_cli_lists_and_restores_backups(tmp_path, capsys):
     assert backup_id in listing
 
     assert doctor.main(["restore", backup_id, "--state", str(root)]) == 0
-    conn = sqlite3.connect(root / "club.db")
+    conn = sqlite3.connect(root / "agent_runs.db")
     try:
-        assert int(conn.execute("PRAGMA user_version").fetchone()[0]) == 0
+        assert int(conn.execute("PRAGMA user_version").fetchone()[0]) == 1
     finally:
         conn.close()
 
@@ -1403,9 +1077,7 @@ def test_orphaned_run_links_are_detected(tmp_path):
 
     report = doctor.diagnose(root)
 
-    assert _finding(report, "agent_run.orphaned_approval").record_count == 1
     assert _finding(report, "agent_run.orphaned_parent").record_count == 1
-    assert _finding(report, "agent_run.orphaned_session").record_count == 1
     assert _finding(report, "agent_run.orphaned_checkpoint").record_count == 1
     assert all(
         item.repair is Repair.REVIEW_REQUIRED
@@ -1497,9 +1169,7 @@ def test_no_planted_secret_survives_the_agent_run_checks(tmp_path):
     # Non-vacuous: every field carrying a canary drove a real finding first.
     for check in (
         "agent_run.unsupported_record",
-        "agent_run.orphaned_approval",
         "agent_run.orphaned_parent",
-        "agent_run.orphaned_session",
         "agent_run.unknown_owner",
     ):
         finding = _finding(report, check)

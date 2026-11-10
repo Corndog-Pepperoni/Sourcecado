@@ -95,7 +95,7 @@ def test_exercise_upgrade_from_the_prior_preview(tmp_path):
     assert outcome.status is UpdateStatus.APPLIED, outcome.reason
     assert fx.bundle_version(install.bundle_path) == "0.0.2"
     assert fx.bundle_version(install.previous_path) == "0.0.1"
-    assert "conversation_db" in outcome.migrated
+    assert "agent_runs_db" in outcome.migrated
     assert outcome.backup_id is not None
     assert migrations.plan_migrations(install.state_root).pending == ()
 
@@ -124,7 +124,7 @@ def test_exercise_failed_update_restores_the_last_usable_version(tmp_path):
     # Doctor and the updater must not disagree about what is on this machine.
     report = doctor.diagnose(install.state_root)
     assert not report.blocked, [item.code for item in report.findings if item.blocking]
-    assert {item.store_id: item.status for item in report.stores}["conversation_db"] in {
+    assert {item.store_id: item.status for item in report.stores}["agent_runs_db"] in {
         "pending",
         "current",
     }
@@ -151,7 +151,7 @@ def test_exercise_rollback_after_a_successful_update(tmp_path):
     assert fx.bundle_version(install.bundle_path) == "0.0.1"
     assert not install.previous_path.exists()
     assert _versions(install.state_root) == versions_before
-    assert "conversation_db" in reverted.restored
+    assert "agent_runs_db" in reverted.restored
     assert not doctor.diagnose(install.state_root).blocked
 
 

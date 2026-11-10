@@ -42,11 +42,6 @@ def build_current_state(root: Path, *, plant_secrets: bool = False) -> Path:
     """Write a full state directory using the real store classes."""
     from coworker.people import PersonStore
     from coworker.store import ConversationStore
-    from coworker.workspace import GrantAccess, WorkspaceGrantStore
-    from coworker.workspace_audit import WorkspaceAuditStore
-    from coworker.workspace_policy import HostApprovalStore
-    from coworker.workspace_runtime import DirectoryRequestStore
-    from coworker.workspace_shell import ShellTaskStore
 
     root = Path(root)
     root.mkdir(parents=True, exist_ok=True)
@@ -147,64 +142,6 @@ def build_current_state(root: Path, *, plant_secrets: bool = False) -> Path:
     )
     people.set_sequence(person_id, "open", actor="director")
 
-    grants = WorkspaceGrantStore(root)
-    grant_root = root.parent / "granted-workspace"
-    grant_root.mkdir(parents=True, exist_ok=True)
-    # A credential pasted into a label or a command summary is the realistic way
-    # a secret reaches a store that is not itself secret-bearing.
-    label = f"Sourcing notes {PLANTED_API_KEY}" if plant_secrets else "Sourcing notes"
-    grants.add(grant_root, label=label, access=GrantAccess.READ_ONLY)
-
-    ShellTaskStore(root).put(
-        {
-            "task_id": "task_1",
-            "status": "succeeded",
-            "execution_target": "docker",
-            "command_summary": (
-                f"curl -H 'authorization: Bearer {PLANTED_BEARER}' api.example.com"
-                if plant_secrets
-                else "ls -la"
-            ),
-            "exit_code": 0,
-        }
-    )
-    DirectoryRequestStore(root).create(
-        {"label": label, "access": "read_only"},
-        session_id="main",
-        run_id="run_a1",
-    )
-    HostApprovalStore(root)._save(
-        {
-            "version": HostApprovalStore.VERSION,
-            "approvals": [
-                {
-                    "id": "host_approval_1",
-                    "fingerprint": "b" * 64,
-                    "command_summary": (
-                        f"npm test --token={PLANTED_API_KEY}"
-                        if plant_secrets
-                        else "npm test"
-                    ),
-                    "cwd": "/tmp/granted-workspace",
-                    "environment_fingerprint": "c" * 64,
-                    "actor": "director",
-                    "created_at": _now(),
-                    "revoked_at": None,
-                }
-            ],
-        }
-    )
-    WorkspaceAuditStore(root).record(
-        receipt_type="shell",
-        tool="shell_run",
-        risk_class="reversible",
-        decision="allow",
-        execution_target="docker",
-        status="succeeded",
-        summary="ran npm test",
-        grant_id="grant_1",
-    )
-
     _write_json(
         root / "mcp.json",
         {"mcpServers": {"granola": {"headers": {"Authorization": PLANTED_BEARER}}}}
@@ -226,8 +163,6 @@ def build_current_state(root: Path, *, plant_secrets: bool = False) -> Path:
         root / ".env",
         f"APOLLO_API_KEY={PLANTED_API_KEY}\n" if plant_secrets else "CLUB_PERSONA=sourcing\n",
     )
-    _write_drive_ingestion_db(root, CURRENT_DRIVE_INGESTION_DDL)
-    _write_meeting_evidence_db(root)
 
     if plant_secrets:
         store.append(
@@ -312,161 +247,6 @@ LEGACY_CONVERSATION_DDL = """
 """
 
 LEGACY_PERSON_ID = "per_0f3c9a1b4d2e4f6a8b0c1d2e3f405162"
-
-# DriveIngestionStore as it shipped before work_revision. user_version stays 0.
-LEGACY_DRIVE_INGESTION_DDL = """
-    CREATE TABLE drive_ingestion_jobs (
-        id TEXT PRIMARY KEY,
-        folder_id TEXT NOT NULL,
-        resolved_path TEXT NOT NULL,
-        status TEXT NOT NULL,
-        generation INTEGER NOT NULL,
-        cancel_requested INTEGER NOT NULL DEFAULT 0,
-        created_at TEXT NOT NULL,
-        updated_at TEXT NOT NULL
-    );
-    CREATE TABLE drive_ingestion_folders (
-        job_id TEXT NOT NULL,
-        drive_id TEXT NOT NULL,
-        parent_id TEXT,
-        path TEXT NOT NULL,
-        status TEXT NOT NULL,
-        page_token TEXT,
-        generation INTEGER NOT NULL,
-        error_kind TEXT,
-        PRIMARY KEY (job_id, drive_id)
-    );
-    CREATE TABLE drive_ingestion_sources (
-        job_id TEXT NOT NULL,
-        drive_id TEXT NOT NULL,
-        scope TEXT NOT NULL DEFAULT 'tree',
-        parent_id TEXT,
-        path TEXT NOT NULL,
-        name TEXT NOT NULL,
-        mime_type TEXT NOT NULL,
-        modified_time TEXT,
-        web_view_link TEXT,
-        sensitivity TEXT NOT NULL DEFAULT 'standard',
-        extraction_status TEXT NOT NULL DEFAULT 'pending',
-        content TEXT,
-        citations_json TEXT NOT NULL DEFAULT '[]',
-        redaction_count INTEGER NOT NULL DEFAULT 0,
-        source_safety_json TEXT,
-        generation INTEGER NOT NULL,
-        last_action TEXT NOT NULL DEFAULT 'pending',
-        error_kind TEXT,
-        deleted INTEGER NOT NULL DEFAULT 0,
-        needs_read INTEGER NOT NULL DEFAULT 1,
-        PRIMARY KEY (job_id, drive_id)
-    );
-    CREATE TABLE drive_ingestion_proposals (
-        id TEXT PRIMARY KEY,
-        job_id TEXT NOT NULL,
-        source_drive_id TEXT NOT NULL,
-        person_id TEXT NOT NULL,
-        record_type TEXT NOT NULL,
-        fields_json TEXT NOT NULL,
-        diff_json TEXT NOT NULL,
-        source_refs_json TEXT NOT NULL,
-        status TEXT NOT NULL,
-        created_at TEXT NOT NULL,
-        reviewed_at TEXT,
-        reviewer TEXT
-    );
-"""
-
-# The constructor's current CREATE TABLE, still at user_version 0 until adopted.
-CURRENT_DRIVE_INGESTION_DDL = """
-    CREATE TABLE drive_ingestion_jobs (
-        id TEXT PRIMARY KEY,
-        folder_id TEXT NOT NULL,
-        resolved_path TEXT NOT NULL,
-        status TEXT NOT NULL,
-        generation INTEGER NOT NULL,
-        work_revision INTEGER NOT NULL DEFAULT 1,
-        cancel_requested INTEGER NOT NULL DEFAULT 0,
-        created_at TEXT NOT NULL,
-        updated_at TEXT NOT NULL
-    );
-    CREATE TABLE drive_ingestion_folders (
-        job_id TEXT NOT NULL,
-        drive_id TEXT NOT NULL,
-        parent_id TEXT,
-        path TEXT NOT NULL,
-        status TEXT NOT NULL,
-        page_token TEXT,
-        generation INTEGER NOT NULL,
-        error_kind TEXT,
-        PRIMARY KEY (job_id, drive_id)
-    );
-    CREATE TABLE drive_ingestion_sources (
-        job_id TEXT NOT NULL,
-        drive_id TEXT NOT NULL,
-        scope TEXT NOT NULL DEFAULT 'tree',
-        parent_id TEXT,
-        path TEXT NOT NULL,
-        name TEXT NOT NULL,
-        mime_type TEXT NOT NULL,
-        modified_time TEXT,
-        web_view_link TEXT,
-        sensitivity TEXT NOT NULL DEFAULT 'standard',
-        extraction_status TEXT NOT NULL DEFAULT 'pending',
-        content TEXT,
-        citations_json TEXT NOT NULL DEFAULT '[]',
-        redaction_count INTEGER NOT NULL DEFAULT 0,
-        source_safety_json TEXT,
-        generation INTEGER NOT NULL,
-        last_action TEXT NOT NULL DEFAULT 'pending',
-        error_kind TEXT,
-        deleted INTEGER NOT NULL DEFAULT 0,
-        needs_read INTEGER NOT NULL DEFAULT 1,
-        PRIMARY KEY (job_id, drive_id)
-    );
-    CREATE TABLE drive_ingestion_proposals (
-        id TEXT PRIMARY KEY,
-        job_id TEXT NOT NULL,
-        source_drive_id TEXT NOT NULL,
-        person_id TEXT NOT NULL,
-        record_type TEXT NOT NULL,
-        fields_json TEXT NOT NULL,
-        diff_json TEXT NOT NULL,
-        source_refs_json TEXT NOT NULL,
-        status TEXT NOT NULL,
-        created_at TEXT NOT NULL,
-        reviewed_at TEXT,
-        reviewer TEXT
-    );
-"""
-
-# MeetingEvidenceStore as it shipped on main. user_version stays 0 until adopted.
-MEETING_EVIDENCE_DDL = """
-    CREATE TABLE meeting_evidence (
-        evidence_id TEXT PRIMARY KEY,
-        provider TEXT NOT NULL,
-        provider_id TEXT NOT NULL,
-        title TEXT NOT NULL,
-        starts_at TEXT,
-        ends_at TEXT,
-        participants_json TEXT NOT NULL,
-        source_ref_json TEXT NOT NULL,
-        notes TEXT,
-        status TEXT NOT NULL,
-        person_id TEXT,
-        match_reason TEXT,
-        created_at TEXT NOT NULL,
-        updated_at TEXT NOT NULL,
-        UNIQUE(provider, provider_id)
-    );
-    CREATE TABLE meeting_candidates (
-        evidence_id TEXT NOT NULL,
-        person_id TEXT NOT NULL,
-        status TEXT NOT NULL,
-        match_reason TEXT NOT NULL,
-        updated_at TEXT NOT NULL,
-        PRIMARY KEY(evidence_id, person_id)
-    );
-"""
-
 
 # The Agent Run store as version 1 shipped it: identity, leases, and
 # checkpoints, and no external-effect fence. Written out in full rather than
@@ -575,8 +355,6 @@ def build_legacy_state(root: Path, *, plant_secrets: bool = False) -> Path:
     conn.close()
     os.chmod(root / "club.db", 0o600)
 
-    _write_drive_ingestion_db(root, LEGACY_DRIVE_INGESTION_DDL)
-    _write_meeting_evidence_db(root)
 
     conv_dir = root / "conversations"
     conv_dir.mkdir(exist_ok=True)
@@ -614,48 +392,10 @@ def build_legacy_state(root: Path, *, plant_secrets: bool = False) -> Path:
         "# 1\n\nCodeology sources design-adjacent engineers first.\n",
     )
 
-    # Pre-registry JSON documents: shaped correctly but carrying no version key.
-    _write_json(
-        root / "workspace_grants.json",
-        {
-            "grants": [
-                {
-                    "id": "grant_legacy_1",
-                    "path": str(root.parent / "granted-workspace"),
-                    "label": "Sourcing notes",
-                    "access": "read_only",
-                    "allow_shell": False,
-                    "filesystem_identity": {"device": 1, "inode": 2},
-                    "created_at": "2026-07-14T18:02:00+00:00",
-                    "updated_at": "2026-07-14T18:02:00+00:00",
-                    "revoked_at": None,
-                }
-            ]
-        },
-    )
-    _write_json(root / "shell_tasks.json", {"tasks": []})
-    _write_json(root / "host_command_approvals.json", {"approvals": []})
-    _write_json(root / "directory_requests.json", {"requests": []})
     _write_json(root / "mcp.json", {"mcpServers": {}})
     _write_json(
         root / "secrets.json",
         {"apollo": {"api_key": PLANTED_API_KEY}} if plant_secrets else {"google": {}},
-    )
-    _write_jsonl(
-        root / "workspace_receipts.jsonl",
-        [
-            {
-                "id": "receipt_legacy_1",
-                "receipt_type": "file",
-                "tool": "fs_write",
-                "risk_class": "reversible",
-                "decision": "allow",
-                "execution_target": "host",
-                "status": "succeeded",
-                "summary": "wrote notes.md",
-                "created_at": "2026-07-14T18:04:00+00:00",
-            }
-        ],
     )
     # The Agent Run store as the build before the external-effect fence left it:
     # version 1 tables, real rows, no `agent_run_effects`. This is the
@@ -732,10 +472,6 @@ def build_legacy_state(root: Path, *, plant_secrets: bool = False) -> Path:
 # --- helpers -------------------------------------------------------------
 
 
-def _now() -> str:
-    return datetime.now(UTC).isoformat()
-
-
 def hours_ago(hours: int) -> str:
     return (datetime.now(UTC) - timedelta(hours=hours)).isoformat()
 
@@ -755,70 +491,3 @@ def _write_json(path: Path, payload: dict[str, Any]) -> None:
 def _write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
     body = "".join(json.dumps(row, sort_keys=True) + "\n" for row in rows)
     _write_private(path, body)
-
-
-def _write_drive_ingestion_db(root: Path, ddl: str) -> None:
-    path = root / "drive_ingestion.db"
-    conn = sqlite3.connect(path)
-    try:
-        conn.executescript(ddl)
-        conn.execute(
-            """
-            INSERT INTO drive_ingestion_jobs
-                (id, folder_id, resolved_path, status, generation, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                "drive_ingest_1",
-                "folder_1",
-                "Codeology/Sourcing",
-                "paused",
-                1,
-                "2026-08-01T09:00:00+00:00",
-                "2026-08-01T09:00:00+00:00",
-            ),
-        )
-        conn.commit()
-    finally:
-        conn.close()
-    os.chmod(path, 0o600)
-
-
-def _write_meeting_evidence_db(root: Path) -> None:
-    path = root / "meeting_evidence.db"
-    conn = sqlite3.connect(path)
-    try:
-        conn.executescript(MEETING_EVIDENCE_DDL)
-        conn.execute(
-            """
-            INSERT INTO meeting_evidence (
-                evidence_id, provider, provider_id, title, starts_at, ends_at,
-                participants_json, source_ref_json, notes, status, person_id,
-                match_reason, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'unmatched', NULL, NULL, ?, ?)
-            """,
-            (
-                "meeting_abc123abc123abc123abcd",
-                "calendar",
-                "evt_1",
-                "Rippling intro",
-                "2026-08-20T16:00:00+00:00",
-                "2026-08-20T16:30:00+00:00",
-                json.dumps([{"name": "Dana Ruiz", "email": "dana@example.com"}]),
-                json.dumps(
-                    {
-                        "id": "calendar:evt_1",
-                        "title": "Rippling intro",
-                        "url": None,
-                        "provider": "Google Calendar",
-                    }
-                ),
-                None,
-                "2026-08-20T16:00:00+00:00",
-                "2026-08-20T16:00:00+00:00",
-            ),
-        )
-        conn.commit()
-    finally:
-        conn.close()
-    os.chmod(path, 0o600)

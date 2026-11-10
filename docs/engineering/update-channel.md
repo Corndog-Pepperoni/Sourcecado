@@ -51,7 +51,7 @@ Ed25519 signature over the canonical bytes of `signed`.
     "artifact_size": 234995,
     "artifact_sha256": "988e24b7…",
     "minimum_upgradable_version": "0.0.1",
-    "state_versions": { "people_db": 1, "conversation_db": 1, "…": 0 },
+    "state_versions": { "agent_runs_db": 2, "…": 0 },
     "released_at": "2026-08-28T05:56:38Z",
     "commit": "fcb6e64aca18c836fa807ee0a009ccd2c9ca3c8a"
   },
@@ -255,7 +255,7 @@ so the prose and the code cannot drift.
 | Exercise | Test | What it proves |
 | --- | --- | --- |
 | Clean install | `test_exercise_clean_install` | No previous application and no previous state. Installs, takes no backup, migrates nothing. |
-| Upgrade from the prior preview | `test_exercise_upgrade_from_the_prior_preview` | State written by the previous build's schema comes forward. Backup taken, `conversation_db` migrated, nothing pending afterwards, previous bundle kept. |
+| Upgrade from the prior preview | `test_exercise_upgrade_from_the_prior_preview` | State written by the previous build's schema comes forward. Backup taken, `agent_runs_db` migrated, nothing pending afterwards, previous bundle kept. |
 | Failed update | `test_exercise_failed_update_restores_the_last_usable_version` | The launch check fails. Bundle back at the old version, staging cleared, every store version back where it started, and Doctor does not disagree. |
 | Rollback | `test_exercise_rollback_after_a_successful_update` | A clean update is deliberately reversed. Bundle and every store restored. |
 

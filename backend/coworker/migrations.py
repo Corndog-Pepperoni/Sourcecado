@@ -29,7 +29,7 @@ import os
 import shutil
 import sqlite3
 import tempfile
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -40,13 +40,7 @@ from coworker.agent_run_approval import EFFECT_STATEMENTS
 from coworker.agent_run_repository import SCHEMA_VERSION as AGENT_RUNS_DB_VERSION
 from coworker.mcp import SCHEMA_VERSION as MCP_CONFIG_VERSION
 from coworker.secrets import SCHEMA_VERSION as SECRETS_VERSION
-from coworker.store import SCHEMA_VERSION as CONVERSATION_DB_VERSION
 from coworker.store import TRANSCRIPT_VERSION
-from coworker.workspace import WorkspaceGrantStore
-from coworker.workspace_audit import SCHEMA_VERSION as RECEIPTS_VERSION
-from coworker.workspace_policy import HostApprovalStore
-from coworker.workspace_runtime import DirectoryRequestStore
-from coworker.workspace_shell import ShellTaskStore
 
 MANIFEST_NAME = "state_versions.json"
 MANIFEST_VERSION = 1
@@ -355,291 +349,11 @@ def _write_version(root: Path, spec: StoreSpec, version: int) -> None:
 
 # --- migration steps -----------------------------------------------------
 
-# The conversation schema that store.py's constructor grew column by column. It
-# is restated here because the registry, not the constructor, is the release
-# contract for what version 1 means.
-_CONVERSATION_ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
-    ("jobs", "next_run_at", "TEXT"),
-    ("jobs", "name", "TEXT"),
-    ("jobs", "template_id", "TEXT"),
-    ("jobs", "cadence", "TEXT"),
-    ("runs", "started_at", "TEXT"),
-    ("runs", "finished_at", "TEXT"),
-    ("runs", "duration_ms", "INTEGER"),
-    ("runs", "summary", "TEXT"),
-    ("runs", "artifacts", "TEXT"),
-    ("runs", "session_id", "TEXT"),
-    ("runs", "waiting_approval_count", "INTEGER DEFAULT 0"),
-    ("sessions", "pinned", "INTEGER NOT NULL DEFAULT 0"),
-    ("sessions", "opened_at", "TEXT"),
-    ("inbox", "actor", "TEXT"),
-    ("inbox", "requested_at", "TEXT"),
-    ("inbox", "resolved_at", "TEXT"),
-    ("inbox", "scope", "TEXT DEFAULT 'once'"),
-    ("inbox", "execution_status", "TEXT DEFAULT 'pending'"),
-    ("inbox", "execution_error", "TEXT"),
-    ("inbox", "execution_claimant", "TEXT"),
-    ("inbox", "execution_result", "TEXT"),
-    ("inbox", "expires_at", "TEXT"),
-    ("inbox", "reason", "TEXT"),
-    ("inbox", "session_id", "TEXT"),
-    ("inbox", "run_id", "TEXT"),
-    ("inbox", "message_id", "TEXT"),
-    ("inbox", "part_id", "TEXT"),
-    ("inbox", "recovery_command_id", "TEXT"),
-    ("inbox", "original_call_id", "TEXT"),
-    ("inbox", "resource", "TEXT"),
-)
-
-_CONVERSATION_ADDED_TABLES = {
-    "chat_queue": """
-        CREATE TABLE IF NOT EXISTS chat_queue (
-            session_id TEXT NOT NULL,
-            id TEXT NOT NULL,
-            text TEXT NOT NULL,
-            position INTEGER NOT NULL,
-            state TEXT NOT NULL,
-            error TEXT,
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL,
-            PRIMARY KEY (session_id, id)
-        );
-        CREATE INDEX IF NOT EXISTS chat_queue_session_position
-            ON chat_queue(session_id, position);
-    """,
-    "queue_commands": """
-        CREATE TABLE IF NOT EXISTS queue_commands (
-            session_id TEXT NOT NULL,
-            command_id TEXT NOT NULL,
-            command_type TEXT NOT NULL,
-            item_id TEXT,
-            acknowledgement TEXT NOT NULL,
-            created_at TEXT NOT NULL,
-            PRIMARY KEY (session_id, command_id)
-        );
-    """,
-    "queue_sessions": """
-        CREATE TABLE IF NOT EXISTS queue_sessions (
-            session_id TEXT PRIMARY KEY,
-            paused INTEGER NOT NULL DEFAULT 0,
-            updated_at TEXT NOT NULL
-        );
-    """,
-    "recovery_commands": """
-        CREATE TABLE IF NOT EXISTS recovery_commands (
-            session_id TEXT NOT NULL,
-            command_id TEXT NOT NULL,
-            created_at TEXT NOT NULL,
-            PRIMARY KEY (session_id, command_id)
-        );
-    """,
-}
-
-# The context-projection-v1 metadata a memory row needs (issue #58): its
-# category, its scope, its Source Reference, when it changed, its freshness
-# window, its sensitivity, and the claim it competes on. Restated here because
-# the registry, not the constructor, is the release contract for version 2.
-_MEMORY_CLASSIFICATION_COLUMNS: tuple[tuple[str, str], ...] = (
-    ("category", "TEXT"),
-    ("classification_status", "TEXT"),
-    ("person_id", "TEXT"),
-    ("session_id", "TEXT"),
-    ("source_ref", "TEXT"),
-    ("updated_at", "TEXT"),
-    ("fresh_until", "TEXT"),
-    ("sensitivity", "TEXT"),
-    ("claim_key", "TEXT"),
-)
-
-def _sqlite_adoption_count(
-    context: MigrationContext,
-    added_columns: Sequence[tuple[str, str, str]],
-    added_tables: dict[str, str],
-) -> int:
-    conn = context.connection
-    assert conn is not None
-    present_tables = table_names(conn)
-    touched_tables = {
-        table
-        for table, column, _definition in added_columns
-        if table in present_tables and column not in column_names(conn, table)
-    }
-    rows = sum(_row_count(conn, table) for table in touched_tables)
-    return rows + sum(1 for table in added_tables if table not in present_tables)
-
-
-def _sqlite_add_columns_and_tables(
-    conn: sqlite3.Connection,
-    added_columns: Sequence[tuple[str, str, str]],
-    added_tables: dict[str, str],
-) -> None:
-    present_tables = table_names(conn)
-    for table, column, definition in added_columns:
-        if table not in present_tables:
-            continue
-        if column in column_names(conn, table):
-            continue
-        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
-    for table, ddl in added_tables.items():
-        conn.executescript(ddl)
-
-
-def _adopt_conversation_db(context: MigrationContext) -> int:
-    conn = context.connection
-    assert conn is not None
-    touched = _sqlite_adoption_count(
-        context, _CONVERSATION_ADDED_COLUMNS, _CONVERSATION_ADDED_TABLES
-    )
-    _sqlite_add_columns_and_tables(
-        conn, _CONVERSATION_ADDED_COLUMNS, _CONVERSATION_ADDED_TABLES
-    )
-    conn.execute(
-        """
-        UPDATE jobs SET
-            name = COALESCE(name, prompt),
-            template_id = COALESCE(template_id, 'legacy'),
-            cadence = COALESCE(cadence, cron)
-        """
-    )
-    conn.execute(
-        """
-        UPDATE runs SET
-            started_at = COALESCE(started_at, created_at),
-            finished_at = CASE
-                WHEN status = 'running' THEN finished_at
-                ELSE COALESCE(finished_at, created_at)
-            END,
-            duration_ms = COALESCE(duration_ms, 0),
-            summary = COALESCE(summary, result, ''),
-            artifacts = COALESCE(artifacts, '[]'),
-            session_id = COALESCE(session_id, 'sched-' || job_id),
-            waiting_approval_count = COALESCE(waiting_approval_count, 0)
-        """
-    )
-    conn.execute("UPDATE sessions SET opened_at = updated_at WHERE opened_at IS NULL")
-    conn.execute(
-        """
-        UPDATE inbox SET
-            requested_at = COALESCE(requested_at, created_at),
-            scope = COALESCE(scope, 'once'),
-            execution_status = COALESCE(execution_status, 'pending')
-        """
-    )
-    return touched
-
-
-def _count_conversation_db(context: MigrationContext) -> int:
-    return _sqlite_adoption_count(
-        context, _CONVERSATION_ADDED_COLUMNS, _CONVERSATION_ADDED_TABLES
-    )
-
-
-def _count_memory_classification(context: MigrationContext) -> int:
-    """How many memory rows still have no classification of their own."""
-    conn = context.connection
-    assert conn is not None
-    if "memories" not in table_names(conn):
-        return 0
-    if "classification_status" not in column_names(conn, "memories"):
-        return _row_count(conn, "memories")
-    return int(
-        conn.execute(
-            "SELECT COUNT(*) FROM memories WHERE classification_status IS NULL"
-        ).fetchone()[0]
-    )
-
-
-def _classify_legacy_memories(context: MigrationContext) -> int:
-    """Move every memory row written before context-projection-v1 to review.
-
-    The category is assigned by where the row came from, never by what it says.
-    A row worded like a global preference and a row stating a fact about one
-    Person are indistinguishable as text, so both land in `legacy_unclassified`
-    with `classification_status = needs_review` and stay out of model context
-    until the director says which is which.
-
-    Ids, content, and `created_at` are untouched, and `MEMORY.md` and the
-    per-row Markdown files are left exactly as they are.
-
-    Executed one statement at a time, never through `executescript`, which
-    issues a COMMIT before it runs. Inside the transaction `_apply_store` opens,
-    that COMMIT would end the transaction and leave the rollback with nothing to
-    undo -- silently, and with the store half migrated.
-    """
-    conn = context.connection
-    assert conn is not None
-    touched = _count_memory_classification(context)
-    present = column_names(conn, "memories")
-    for column, definition in _MEMORY_CLASSIFICATION_COLUMNS:
-        if column in present:
-            continue
-        conn.execute(f"ALTER TABLE memories ADD COLUMN {column} {definition}")
-    conn.execute(
-        """
-        UPDATE memories SET
-            category = 'legacy_unclassified',
-            classification_status = 'needs_review',
-            source_ref = 'sourcecado:memory/' || id,
-            updated_at = COALESCE(updated_at, created_at),
-            sensitivity = COALESCE(sensitivity, 'standard')
-        WHERE classification_status IS NULL
-        """
-    )
-    return touched
-
-
-# DriveIngestionStore grew `work_revision` onto jobs after the first ship. The
-# constructor still adds it with a column-existence probe; version 1 is that
-# column being present and recorded.
-_DRIVE_INGESTION_ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
-    ("drive_ingestion_jobs", "work_revision", "INTEGER NOT NULL DEFAULT 1"),
-)
-
-
-def _adopt_drive_ingestion_db(context: MigrationContext) -> int:
-    conn = context.connection
-    assert conn is not None
-    touched = _sqlite_adoption_count(context, _DRIVE_INGESTION_ADDED_COLUMNS, {})
-    _sqlite_add_columns_and_tables(conn, _DRIVE_INGESTION_ADDED_COLUMNS, {})
-    return touched
-
-
-def _count_drive_ingestion_db(context: MigrationContext) -> int:
-    return _sqlite_adoption_count(context, _DRIVE_INGESTION_ADDED_COLUMNS, {})
-
-
-def _count_meeting_evidence_db(context: MigrationContext) -> int:
-    conn = context.connection
-    assert conn is not None
-    return _row_count(conn, "meeting_evidence") + _row_count(conn, "meeting_candidates")
-
-
-def _adopt_meeting_evidence_db(context: MigrationContext) -> int:
-    return _count_meeting_evidence_db(context)
-
-
-def _count_json_records(context: MigrationContext) -> int:
-    spec = context.spec
-    if spec.container_key is None:
-        return 0
-    document = read_json_document(context.root, spec)
-    return len(document.get(spec.container_key) or [])
-
-
-def _adopt_json_document(context: MigrationContext) -> int:
-    """Validate the shape, then let the engine stamp the version key."""
-    return _count_json_records(context)
-
-
 def count_jsonl_records(path: Path) -> int:
     if not path.is_file():
         return 0
     with path.open("r", encoding="utf-8", errors="replace") as handle:
         return sum(1 for line in handle if line.strip())
-
-
-def _count_log_records(context: MigrationContext) -> int:
-    return count_jsonl_records(context.path)
 
 
 def _count_dir_records(context: MigrationContext) -> int:
@@ -663,7 +377,6 @@ def _adopt_recorded_store(context: MigrationContext) -> int:
 _RECORDED_COUNTERS: dict[str, Callable[[MigrationContext], int]] = {
     "conversation_transcripts": _count_dir_records,
     "presentation_events": _count_dir_records,
-    "workspace_receipts": _count_log_records,
     "secrets": _count_opaque_records,
     "mcp_config": _count_opaque_records,
 }
@@ -764,76 +477,6 @@ REGISTRY: tuple[StoreSpec, ...] = (
         ),
     ),
     StoreSpec(
-        store_id="conversation_db",
-        kind=StoreKind.SQLITE,
-        relative_path="club.db",
-        current_version=CONVERSATION_DB_VERSION,
-        version_channel=VersionChannel.SQLITE_USER_VERSION,
-        description="Sessions, memories, schedule, approvals, and the chat queue.",
-        migrations=_adopt(
-            "Adopt the conversation schema shipped before the registry existed.",
-            _count_conversation_db,
-            _adopt_conversation_db,
-        )
-        + (
-            Migration(
-                from_version=1,
-                to_version=2,
-                description=(
-                    "Give every memory row a category, a scope, a Source "
-                    "Reference, and a freshness window, and withhold the "
-                    "unclassified ones from model context."
-                ),
-                count=_count_memory_classification,
-                apply=_classify_legacy_memories,
-            ),
-        ),
-        json_columns=(
-            ("inbox", "arguments"),
-            ("inbox", "execution_result"),
-            ("inbox", "resource"),
-            ("runs", "artifacts"),
-            ("queue_commands", "acknowledgement"),
-        ),
-    ),
-    StoreSpec(
-        store_id="drive_ingestion",
-        kind=StoreKind.SQLITE,
-        relative_path="drive_ingestion.db",
-        current_version=1,
-        version_channel=VersionChannel.SQLITE_USER_VERSION,
-        description="Drive folder ingestion jobs, indexed sources, and person-file proposals.",
-        migrations=_adopt(
-            "Adopt the Drive ingestion schema shipped before the registry existed.",
-            _count_drive_ingestion_db,
-            _adopt_drive_ingestion_db,
-        ),
-        json_columns=(
-            ("drive_ingestion_sources", "citations_json"),
-            ("drive_ingestion_sources", "source_safety_json"),
-            ("drive_ingestion_proposals", "fields_json"),
-            ("drive_ingestion_proposals", "diff_json"),
-            ("drive_ingestion_proposals", "source_refs_json"),
-        ),
-    ),
-    StoreSpec(
-        store_id="meeting_evidence",
-        kind=StoreKind.SQLITE,
-        relative_path="meeting_evidence.db",
-        current_version=1,
-        version_channel=VersionChannel.SQLITE_USER_VERSION,
-        description="Calendar and Granola meeting evidence attached to person files.",
-        migrations=_adopt(
-            "Adopt the meeting evidence schema shipped before the registry existed.",
-            _count_meeting_evidence_db,
-            _adopt_meeting_evidence_db,
-        ),
-        json_columns=(
-            ("meeting_evidence", "participants_json"),
-            ("meeting_evidence", "source_ref_json"),
-        ),
-    ),
-    StoreSpec(
         store_id="conversation_transcripts",
         kind=StoreKind.JSONL_DIR,
         relative_path="conversations",
@@ -867,83 +510,6 @@ REGISTRY: tuple[StoreSpec, ...] = (
         current_version=0,
         version_channel=VersionChannel.NONE,
         description="Markdown mirror of the memories table. Checked, never migrated.",
-    ),
-    StoreSpec(
-        store_id="workspace_receipts",
-        kind=StoreKind.JSONL_LOG,
-        relative_path="workspace_receipts.jsonl",
-        current_version=RECEIPTS_VERSION,
-        version_channel=VersionChannel.MANIFEST,
-        description="Immutable receipts for workspace authority and execution.",
-        migrations=_adopt(
-            "Record the receipt log version alongside the store.",
-            _count_log_records,
-            _adopt_recorded_store,
-        ),
-    ),
-    StoreSpec(
-        store_id="workspace_grants",
-        kind=StoreKind.JSON_DOCUMENT,
-        relative_path="workspace_grants.json",
-        current_version=WorkspaceGrantStore.VERSION,
-        version_channel=VersionChannel.JSON_VERSION_KEY,
-        description="Operator grants over local directories.",
-        container_key="grants",
-        migrations=_adopt(
-            "Stamp the grant document with its version.",
-            _count_json_records,
-            _adopt_json_document,
-        ),
-    ),
-    StoreSpec(
-        store_id="shell_tasks",
-        kind=StoreKind.JSON_DOCUMENT,
-        relative_path="shell_tasks.json",
-        current_version=ShellTaskStore.VERSION,
-        version_channel=VersionChannel.JSON_VERSION_KEY,
-        description="Workspace shell tasks and their last known status.",
-        container_key="tasks",
-        migrations=_adopt(
-            "Stamp the shell task document with its version.",
-            _count_json_records,
-            _adopt_json_document,
-        ),
-    ),
-    StoreSpec(
-        store_id="host_command_approvals",
-        kind=StoreKind.JSON_DOCUMENT,
-        relative_path="host_command_approvals.json",
-        current_version=HostApprovalStore.VERSION,
-        version_channel=VersionChannel.JSON_VERSION_KEY,
-        description="Persistent allow-always decisions for direct host commands.",
-        container_key="approvals",
-        migrations=_adopt(
-            "Stamp the host approval document with its version.",
-            _count_json_records,
-            _adopt_json_document,
-        ),
-    ),
-    StoreSpec(
-        store_id="directory_requests",
-        kind=StoreKind.JSON_DOCUMENT,
-        relative_path="directory_requests.json",
-        current_version=DirectoryRequestStore.VERSION,
-        version_channel=VersionChannel.JSON_VERSION_KEY,
-        description="Pending and resolved requests for workspace authority.",
-        container_key="requests",
-        migrations=_adopt(
-            "Stamp the directory request document with its version.",
-            _count_json_records,
-            _adopt_json_document,
-        ),
-    ),
-    StoreSpec(
-        store_id="workspace_trash",
-        kind=StoreKind.DIRECTORY,
-        relative_path="workspace_trash",
-        current_version=0,
-        version_channel=VersionChannel.NONE,
-        description="Reversible workspace deletes. Checked, never migrated.",
     ),
     StoreSpec(
         store_id="secrets",
