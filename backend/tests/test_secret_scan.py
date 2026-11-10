@@ -170,6 +170,53 @@ def test_after_rotation_the_revoked_value_is_still_found_in_conversations_and_ev
     assert replacement not in payload
 
 
+# --- an incomplete scan is not a clean one ----------------------------------
+
+
+@pytest.mark.parametrize(
+    "dirname,store_id",
+    [
+        ("conversations", "conversation_transcripts"),
+        ("events", "presentation_events"),
+    ],
+)
+def test_an_unlistable_jsonl_directory_is_not_reported_clean(
+    tmp_path, capsys, dirname, store_id
+):
+    """Path.glob on an unlistable directory returns [] without raising.
+
+    Public seam: scan_state / ScanReport.unreadable / ScanReport.clean / main.
+    A conversations/ or events/ directory that cannot be listed still holds
+    the planted file. That must land in unreadable, must not print
+    'clean -- no match found', and must not exit 0.
+    """
+    root = tmp_path / "state"
+    root.mkdir()
+    probe = _probe_value()
+    _write_secrets(root, {"probe": {"api_key": probe}})
+    folder = root / dirname
+    folder.mkdir()
+    (folder / "main.jsonl").write_text(
+        json.dumps({"role": "user", "content": f"using {probe}"}) + "\n",
+        encoding="utf-8",
+    )
+    os.chmod(folder, 0o000)
+    try:
+        report = scan_state(root, secret_key="probe")
+        code = main(["--state", str(root), "--secret-key", "probe"])
+        captured = capsys.readouterr()
+    finally:
+        os.chmod(folder, 0o700)
+
+    assert store_id in report.unreadable
+    assert not report.clean
+    rendered = report.render()
+    assert "clean -- no match found" not in rendered
+    assert probe not in rendered
+    assert code == 2
+    assert probe not in captured.out
+
+
 # --- bounded output ----------------------------------------------------------
 
 
