@@ -49,7 +49,7 @@ def _installed(**overrides) -> m.BuildIdentity:
         "version": "0.0.1",
         "platform": "macos",
         "arch": "aarch64",
-        "state_versions": {"conversation_db": 1, "conversation_db": 3},
+        "state_versions": {"conversation_db": 3},
     }
     fields.update(overrides)
     return m.BuildIdentity(**fields)
@@ -66,7 +66,7 @@ def _signed(artifact_path, **overrides) -> dict:
         "artifact_size": artifact_path.stat().st_size,
         "artifact_sha256": m.sha256_file(artifact_path),
         "minimum_upgradable_version": "0.0.1",
-        "state_versions": {"conversation_db": 1, "conversation_db": 3},
+        "state_versions": {"conversation_db": 3},
         "released_at": "2026-08-27T12:00:00+00:00",
         "commit": "0" * 40,
     }

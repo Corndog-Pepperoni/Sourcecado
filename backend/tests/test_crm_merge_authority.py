@@ -326,15 +326,16 @@ def test_source_validation_and_new_task_commit_share_write_transaction(tmp_path,
             thread = threading.Thread(target=revert)
             thread.start()
             thread.join(timeout=2)
-            blocked.append(thread)
+            # Still inside the task write: the revert must be waiting.
+            blocked.append((thread, thread.is_alive(), len(reverts)))
         return refs
 
     monkeypatch.setattr(crm_tasks, "source_ids", validate)
     saved = service.create(pid, title="Sourced promise", actor="assistant", source_refs=[source["id"]],
         operation_id="merge-source-create", timezone="America/Los_Angeles")
     monkeypatch.setattr(crm_tasks, "source_ids", original)
-    thread = blocked[0]
-    assert not reverts, "the revert ran inside the task write"
+    thread, waiting, finished = blocked[0]
+    assert waiting and finished == 0, "the revert ran inside the task write"
     thread.join(timeout=30)
     assert not thread.is_alive() and len(reverts) == 1
     # The revert ran after the commit, so it kept the source the task cites.

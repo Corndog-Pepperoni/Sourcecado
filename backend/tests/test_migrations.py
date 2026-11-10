@@ -1,6 +1,5 @@
 """S5: one versioned migration registry across every durable Sourcecado store."""
 
-import dataclasses
 import hashlib
 import json
 import os
