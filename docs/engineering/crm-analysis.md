@@ -205,34 +205,27 @@ provider error text, tokens, or hidden reasoning. Successful results and the
 analyzed revision commit together, so restarting after commit finds no work
 to replay. Failures preserve existing descriptions.
 
-## Upgrade and verification
+## Schema and transactions
 
-`people.db` v7 is registered in `migrations.py`. A new empty, unversioned
-database records v7 after initialization, before current-version writes.
-An existing database keeps its recorded version, including unversioned legacy
-state and unsupported future versions; constructor table probes never adopt it.
-Stop the backend and use `make doctor-repair` before restarting a legacy/v5/v6
-installation. This path backs up and migrates the store; constructors alone
-cannot widen SQLite's old CRM-history constraint. The worker checks both the
-declared version, history and task-stage shape and returns `crm_migration_required`
-before model spend. Historical DDL remains frozen. The registered v6→v7 step adds
-the stage marker and `crm_task_evidence` span/FK records without AI backfill.
-Already-analyzed v6 inputs become eligible for the new stage. Person snapshot
-revert preserves current source rows supporting independent tasks, history and
-proposals, including current restrictions; it does not revert task work.
+The CRM tables are in Postgres. The schema is the migration
+`supabase/migrations/20261110000400_people.sql` (migration slice S04). It is
+the only schema: the SQLite versions and their upgrade steps were removed when
+the store moved to Postgres. Every row has a `user_id`, and every query filters
+by it.
 
-Until migration, safe human description saves and operation replay retain the
-pre-v6 event-receipt behavior. They do not add v6 CRM-history rows that an old
-migration cannot represent. Inferred writes and scoped undo require the current
-schema. Replaying an old receipt after migration still returns the saved result.
+`PersonStore.transaction()` is the one transaction that the CRM modules share.
+A nested call joins the open transaction. `crm_transaction()` and the writers
+that SQLite started with `BEGIN IMMEDIATE` take a per-user advisory lock, so
+one CRM writer runs at a time for each user. Person snapshot revert preserves
+current source rows supporting independent tasks, history and proposals,
+including current restrictions; it does not revert task work.
 
 Offline tests use read-only connector and model fixtures. They cover both
 slots, sources, protected blanks, stale generation/acceptance, private and
 mismatched mail, outbound attribution, injection/tool output, incomplete mail,
 retries, failover and unknown accounting, cancellation, atomic rollback,
 dismissal after prompt-key changes, field-scoped undo, real app routes,
-restart, populated v5/v6 and legacy migrations, migration rollback, foreign keys and snapshot
-restore. No live Gmail/provider call, proposal review UI or native background
+restart, foreign keys and snapshot restore. No live Gmail/provider call, proposal review UI or native background
 refresh demonstration is claimed. Task fixtures cover explicit/relative/vague dates,
 conditions, quoted and partial mail, wrong/shared/private attribution, corrected
 human dates, same-message promises, embedded/past-action deadlines, varied
@@ -272,22 +265,11 @@ mail identity. `latest_revision` and `analyzed_revision` track the bounded,
 currently attributed analysis input. Mail arriving after preparation stays
 pending; the scheduler cannot mark that newer collection revision observed.
 
-Schema 8 recognizes the actual shapes of the independently developed v6 and
-v7 stores, including tracked-mail-only, guarded analysis/task, and attention
-layouts. The registered Doctor migration backs up first, converts source
-pointers and histories without reducing restrictions, preserves exact retry
-receipts, and retains otherwise incompatible legacy attempt records for audit.
-It reconnects accepted-proposal and automatic-creation Undo receipts to their
-original target changes. Legacy interpretation fingerprints suppress unchanged
-accepted, dismissed or undone work; changed evidence remains eligible. Migration
-itself does not call a model or create outreach tasks.
-
 Status and attention Undo compare the changed field and its later receipts,
 not the whole person's version. Unrelated descriptions, flags and tasks remain
 intact. Accepting a proposal records the target mutation and its resolution
 atomically. Undoing an unchanged accepted task creation cancels that exact task
 and suppresses the interpretation; later human edits cause a conflict.
 
-`crm_schema.py` describes the historical attention layout for upgrade fixtures.
-It is not a second active schema or worker. Frozen historical migration steps
-remain separate from the shape-aware schema-8 unification.
+`crm_legacy_compat.py` still reads decisions that older stores recorded. Such
+rows reach Postgres only through a data import.

@@ -33,6 +33,7 @@ class CrmService:
         self.people = people
         self.tasks = TaskService(people)
         self.conn = people._conn
+        self.user_id = people._user_id
 
     def _person(self, pid):
         return self.tasks._live_person(pid)
@@ -70,8 +71,8 @@ class CrmService:
                 return
             seen.add(change_id)
             row = self.conn.execute(
-                "SELECT * FROM crm_changes WHERE person_id=? AND change_id=?",
-                (pid, change_id),
+                "SELECT * FROM crm_changes WHERE user_id=%s AND person_id=%s AND change_id=%s",
+                (self.user_id, pid, change_id),
             ).fetchone()
             if not row:
                 raise TaskNotFound("unknown receipt change")
@@ -137,10 +138,11 @@ class CrmService:
             "created_at": self.people._now(),
         }
         self.conn.execute(
-            """INSERT INTO crm_changes(change_id,person_id,entity_type,entity_id,
+            """INSERT INTO crm_changes(user_id,change_id,person_id,entity_type,entity_id,
             entity_version,action,before_json,after_json,actor,reason,source_refs,operation_id,
-            session_id,run_id,compensates_change_id,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            session_id,run_id,compensates_change_id,created_at) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
             (
+                self.user_id,
                 change["change_id"],
                 pid,
                 kind,
@@ -161,8 +163,10 @@ class CrmService:
         )
         response = {kind: after, "change": change, "replayed": False}
         self.conn.execute(
-            "INSERT INTO crm_operations VALUES(?,?,?,?,?,?,?)",
+            """INSERT INTO crm_operations(user_id,operation_id,fingerprint,change_id,entity_type,
+            entity_id,response_json,created_at) VALUES(%s,%s,%s,%s,%s,%s,%s,%s)""",
             (
+                self.user_id,
                 operation,
                 fingerprint,
                 change["change_id"],
@@ -190,8 +194,8 @@ class CrmService:
 
     def _bump_person(self, pid):
         self.conn.execute(
-            "UPDATE people SET version=version+1, updated_at=? WHERE person_id=?",
-            (self.people._now(), pid),
+            "UPDATE people SET version=version+1, updated_at=%s WHERE user_id=%s AND person_id=%s",
+            (self.people._now(), self.user_id, pid),
         )
         version = self._person(pid)["version"]
         self.people._snapshot(pid, version, self.people._now())
@@ -239,8 +243,8 @@ class CrmService:
                 "until": person["attention_until"],
             }
             self.conn.execute(
-                "UPDATE people SET attention_reason=?,attention_until=? WHERE person_id=?",
-                (reason, until, pid),
+                "UPDATE people SET attention_reason=%s,attention_until=%s WHERE user_id=%s AND person_id=%s",
+                (reason, until, self.user_id, pid),
             )
             version = self._bump_person(pid)
             return self._record(
@@ -283,8 +287,8 @@ class CrmService:
             # historical request, with current source checks, before the writer
             # treats a cross-store operation ID as a collision.
             legacy = self.conn.execute(
-                "SELECT 1 FROM crm_operations WHERE operation_id=? AND entity_type='description'",
-                (operation_id,),
+                "SELECT 1 FROM crm_operations WHERE user_id = %s AND operation_id=%s AND entity_type='description'",
+                (self.user_id, operation_id),
             ).fetchone()
             if legacy:
                 fingerprint = _fingerprint(
@@ -320,18 +324,19 @@ class CrmService:
             )
             if evidence_revision is not None:
                 self.conn.execute(
-                    "UPDATE person_descriptions SET analyzed_revision=? WHERE person_id=? AND slot=?",
-                    (evidence_revision, pid, slot),
+                    "UPDATE person_descriptions SET analyzed_revision=%s WHERE user_id=%s AND person_id=%s AND slot=%s",
+                    (evidence_revision, self.user_id, pid, slot),
                 )
             return result
 
     def _write_description(self, pid, value):
         now = self.people._now()
         self.conn.execute(
-            """INSERT INTO person_descriptions(person_id,slot,text,authority,source_refs,version,created_at,updated_at)
-            VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(person_id,slot) DO UPDATE SET text=excluded.text,
+            """INSERT INTO person_descriptions(user_id,person_id,slot,text,authority,source_refs,version,created_at,updated_at)
+            VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT(user_id,person_id,slot) DO UPDATE SET text=excluded.text,
             authority=excluded.authority,source_refs=excluded.source_refs,version=excluded.version,updated_at=excluded.updated_at""",
             (
+                self.user_id,
                 pid,
                 value["slot"],
                 value["text"],
@@ -343,8 +348,8 @@ class CrmService:
             ),
         )
         self.conn.execute(
-            "UPDATE person_descriptions SET analyzed_revision=? WHERE person_id=? AND slot=?",
-            (value.get("analyzed_input_revision", 0), pid, value["slot"]),
+            "UPDATE person_descriptions SET analyzed_revision=%s WHERE user_id=%s AND person_id=%s AND slot=%s",
+            (value.get("analyzed_input_revision", 0), self.user_id, pid, value["slot"]),
         )
 
     def validate_sources(self, pid, sources, allowed_source_ids=None):
@@ -397,11 +402,11 @@ class CrmService:
         return result
 
     def proposals(self, pid, *, limit=100, allowed_source_ids=None):
-        with self.people._lock:
+        with self.people.transaction():
             self._person(pid)
             rows = self.conn.execute(
-                "SELECT * FROM crm_proposals WHERE person_id=? AND state='pending' ORDER BY created_at,proposal_id LIMIT ?",
-                (pid, limit),
+                "SELECT * FROM crm_proposals WHERE user_id = %s AND person_id=%s AND state='pending' ORDER BY created_at,proposal_id LIMIT %s",
+                (self.user_id, pid, limit),
             ).fetchall()
             return [
                 self._proposal(row, allowed_source_ids)
@@ -412,9 +417,11 @@ class CrmService:
             ]
 
     def all_proposals(self, *, limit=100, offset=0, allowed_source_ids=None):
-        with self.people._lock:
+        with self.people.transaction():
             rows = self.conn.execute(
-                "SELECT c.* FROM crm_proposals c JOIN people p ON p.person_id=c.person_id WHERE c.state='pending' AND p.deleted_at IS NULL ORDER BY c.created_at,c.proposal_id"
+                "SELECT c.* FROM crm_proposals c JOIN people p ON p.user_id=c.user_id AND p.person_id=c.person_id"
+                " WHERE c.user_id=%s AND c.state='pending' AND p.deleted_at IS NULL ORDER BY c.created_at,c.proposal_id",
+                (self.user_id,),
             ).fetchall()
             visible = [
                 r
@@ -438,12 +445,12 @@ class CrmService:
             return {"proposals": result, "truncated": len(visible) > offset + limit}
 
     def recent_changes(self, pid, *, limit=50, allowed_source_ids=None):
-        with self.people._lock:
+        with self.people.transaction():
             self._person(pid)
             result = []
             for row in self.conn.execute(
-                "SELECT * FROM crm_changes WHERE person_id=? ORDER BY rowid DESC LIMIT ?",
-                (pid, limit),
+                "SELECT * FROM crm_changes WHERE user_id = %s AND person_id=%s ORDER BY seq DESC LIMIT %s",
+                (self.user_id, pid, limit),
             ):
                 if not sources_visible(
                     self.people, pid, json.loads(row["source_refs"]), allowed_source_ids
@@ -479,8 +486,8 @@ class CrmService:
             if kind == "proposal" and row["action"] == "accept":
                 target = after.get("change_id")
                 target_row = self.conn.execute(
-                    "SELECT * FROM crm_changes WHERE person_id=? AND change_id=?",
-                    (row["person_id"], target),
+                    "SELECT * FROM crm_changes WHERE user_id = %s AND person_id=%s AND change_id=%s",
+                    (self.user_id, row["person_id"], target),
                 ).fetchone()
                 if not target_row:
                     return False
@@ -504,8 +511,9 @@ class CrmService:
                 return (
                     self._person(row["person_id"])["sequence_state"] == after["state"]
                     and not self.conn.execute(
-                        "SELECT 1 FROM crm_changes WHERE person_id=? AND entity_type='status' AND rowid>(SELECT rowid FROM crm_changes WHERE change_id=?)",
-                        (row["person_id"], row["change_id"]),
+                        "SELECT 1 FROM crm_changes WHERE user_id=%s AND person_id=%s AND entity_type='status'"
+                        " AND seq>(SELECT seq FROM crm_changes WHERE user_id=%s AND change_id=%s)",
+                        (self.user_id, row["person_id"], self.user_id, row["change_id"]),
                     ).fetchone()
                 )
             if kind == "attention":
@@ -514,8 +522,9 @@ class CrmService:
                     "reason": person["attention_reason"],
                     "until": person["attention_until"],
                 } == after and not self.conn.execute(
-                    "SELECT 1 FROM crm_changes WHERE person_id=? AND entity_type='attention' AND rowid>(SELECT rowid FROM crm_changes WHERE change_id=?)",
-                    (row["person_id"], row["change_id"]),
+                    "SELECT 1 FROM crm_changes WHERE user_id=%s AND person_id=%s AND entity_type='attention'"
+                    " AND seq>(SELECT seq FROM crm_changes WHERE user_id=%s AND change_id=%s)",
+                    (self.user_id, row["person_id"], self.user_id, row["change_id"]),
                 ).fetchone()
         except (TaskError, ValueError, TypeError):
             return False
@@ -537,8 +546,8 @@ class CrmService:
             self._person(pid)
             refs = self.validate_sources(pid, sources) if sources else []
             prior = self.conn.execute(
-                "SELECT * FROM crm_proposals WHERE person_id=? AND intent_key=? AND support_source_fingerprint=?",
-                (pid, "ui:" + kind, fingerprint),
+                "SELECT * FROM crm_proposals WHERE user_id = %s AND person_id=%s AND intent_key=%s AND support_source_fingerprint=%s",
+                (self.user_id, pid, "ui:" + kind, fingerprint),
             ).fetchone()
             if prior:
                 return self._proposal(prior)
@@ -548,9 +557,10 @@ class CrmService:
                 value.get("text", "") if kind == "description" else json.dumps(value)
             )
             self.conn.execute(
-                """INSERT INTO crm_proposals(proposal_id,person_id,target_kind,target_id,target_slot,proposed_value,expected_target_version,reason,source_refs,intent_key,support_source_fingerprint,input_revision,state,created_at,updated_at)
-                VALUES(?,?,?,?,?,?,?,?,?,?,?,0,'pending',?,?)""",
+                """INSERT INTO crm_proposals(user_id,proposal_id,person_id,target_kind,target_id,target_slot,proposed_value,expected_target_version,reason,source_refs,intent_key,support_source_fingerprint,input_revision,state,created_at,updated_at)
+                VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,0,'pending',%s,%s)""",
                 (
+                    self.user_id,
                     proposal_id,
                     pid,
                     kind,
@@ -568,7 +578,7 @@ class CrmService:
             )
             return self._proposal(
                 self.conn.execute(
-                    "SELECT * FROM crm_proposals WHERE proposal_id=?", (proposal_id,)
+                    "SELECT * FROM crm_proposals WHERE user_id = %s AND proposal_id=%s", (self.user_id, proposal_id)
                 ).fetchone()
             )
 
@@ -622,15 +632,15 @@ class CrmService:
             replay = self.tasks._replay(op, fp, legacy_fingerprint=legacy_fp)
             if replay:
                 row = self.conn.execute(
-                    "SELECT source_refs FROM crm_proposals WHERE person_id=? AND proposal_id=?",
-                    (pid, proposal_id),
+                    "SELECT source_refs FROM crm_proposals WHERE user_id = %s AND person_id=%s AND proposal_id=%s",
+                    (self.user_id, pid, proposal_id),
                 ).fetchone()
                 if row:
                     source_ids(self.people, pid, json.loads(row[0]), allowed_source_ids)
                 return self._permitted_receipt(pid, replay, allowed_source_ids)
             row = self.conn.execute(
-                "SELECT * FROM crm_proposals WHERE person_id=? AND proposal_id=?",
-                (pid, proposal_id),
+                "SELECT * FROM crm_proposals WHERE user_id = %s AND person_id=%s AND proposal_id=%s",
+                (self.user_id, pid, proposal_id),
             ).fetchone()
             if not row:
                 raise TaskNotFound("unknown proposal")
@@ -749,8 +759,8 @@ class CrmService:
                 else None
             )
             self.conn.execute(
-                "UPDATE crm_proposals SET state=?,resolution=?,change_id=?,version=version+1,updated_at=? WHERE proposal_id=?",
-                (decision, "director", target, self.people._now(), proposal_id),
+                "UPDATE crm_proposals SET state=%s,resolution=%s,change_id=%s,version=version+1,updated_at=%s WHERE user_id = %s AND proposal_id=%s",
+                (decision, "director", target, self.people._now(), self.user_id, proposal_id),
             )
             after = {**proposal, "state": decision, "change_id": target}
             result = self._record(
@@ -773,8 +783,8 @@ class CrmService:
                 {k: v for k, v in committed.items() if k not in ("change", "replayed")}
             )
             self.conn.execute(
-                "UPDATE crm_operations SET response_json=? WHERE operation_id=?",
-                (json.dumps(result), op),
+                "UPDATE crm_operations SET response_json=%s WHERE user_id = %s AND operation_id=%s",
+                (json.dumps(result), self.user_id, op),
             )
             return result
 
@@ -799,7 +809,7 @@ class CrmService:
             self._version(person["version"], expected_version)
             before = {"state": person["sequence_state"]}
             self.conn.execute(
-                "UPDATE people SET sequence_state=? WHERE person_id=?", (state, pid)
+                "UPDATE people SET sequence_state=%s WHERE user_id = %s AND person_id=%s", (state, self.user_id, pid)
             )
             version = self._bump_person(pid)
             return self._record(
@@ -881,8 +891,8 @@ class CrmService:
         with self.people.crm_transaction():
             self._person(pid)
             original = self.conn.execute(
-                "SELECT * FROM crm_changes WHERE person_id=? AND change_id=?",
-                (pid, change_id),
+                "SELECT * FROM crm_changes WHERE user_id = %s AND person_id=%s AND change_id=%s",
+                (self.user_id, pid, change_id),
             ).fetchone()
             if not original:
                 raise TaskNotFound("unknown change")
@@ -910,8 +920,8 @@ class CrmService:
                 )
             if original["entity_type"] == "description":
                 legacy = self.conn.execute(
-                    "SELECT 1 FROM crm_operations WHERE operation_id=? AND entity_type='description'",
-                    (op,),
+                    "SELECT 1 FROM crm_operations WHERE user_id = %s AND operation_id=%s AND entity_type='description'",
+                    (self.user_id, op),
                 ).fetchone()
                 if legacy:
                     replay = self.tasks._replay(op, fp)
@@ -940,8 +950,8 @@ class CrmService:
                 after = json.loads(row["after_json"])
                 target = after.get("change_id")
                 row = self.conn.execute(
-                    "SELECT * FROM crm_changes WHERE person_id=? AND change_id=?",
-                    (pid, target),
+                    "SELECT * FROM crm_changes WHERE user_id = %s AND person_id=%s AND change_id=%s",
+                    (self.user_id, pid, target),
                 ).fetchone()
                 if not row:
                     raise TaskConflict(
@@ -998,8 +1008,8 @@ class CrmService:
                     current = {"state": person["sequence_state"]}
                     restored = before
                     self.conn.execute(
-                        "UPDATE people SET sequence_state=? WHERE person_id=?",
-                        (before["state"], pid),
+                        "UPDATE people SET sequence_state=%s WHERE user_id = %s AND person_id=%s",
+                        (before["state"], self.user_id, pid),
                     )
                 elif kind == "attention":
                     current = {
@@ -1008,8 +1018,8 @@ class CrmService:
                     }
                     restored = before
                     self.conn.execute(
-                        "UPDATE people SET attention_reason=?,attention_until=? WHERE person_id=?",
-                        (before["reason"], before["until"], pid),
+                        "UPDATE people SET attention_reason=%s,attention_until=%s WHERE user_id = %s AND person_id=%s",
+                        (before["reason"], before["until"], self.user_id, pid),
                     )
                 else:
                     raise TaskError("This receipt cannot be undone")
@@ -1017,8 +1027,8 @@ class CrmService:
                 result = {kind: restored}
             if proposal_id:
                 self.conn.execute(
-                    "UPDATE crm_proposals SET state='dismissed',resolution='undo',version=version+1,updated_at=? WHERE proposal_id=?",
-                    (self.people._now(), proposal_id),
+                    "UPDATE crm_proposals SET state='dismissed',resolution='undo',version=version+1,updated_at=%s WHERE user_id = %s AND proposal_id=%s",
+                    (self.people._now(), self.user_id, proposal_id),
                 )
                 current = json.loads(original["after_json"])
                 restored = {**current, "state": "dismissed"}
@@ -1049,12 +1059,12 @@ class CrmService:
                 {k: v for k, v in result.items() if k not in ("change", "replayed")}
             )
             self.conn.execute(
-                "UPDATE crm_operations SET response_json=? WHERE operation_id=?",
-                (json.dumps(recorded), op),
+                "UPDATE crm_operations SET response_json=%s WHERE user_id = %s AND operation_id=%s",
+                (json.dumps(recorded), self.user_id, op),
             )
             self.conn.execute(
-                "UPDATE crm_interpretations SET suppressed=1 WHERE person_id=? AND change_id=?",
-                (pid, row["change_id"]),
+                "UPDATE crm_interpretations SET suppressed=1 WHERE user_id = %s AND person_id=%s AND change_id=%s",
+                (self.user_id, pid, row["change_id"]),
             )
             return recorded
 
@@ -1069,14 +1079,15 @@ class CrmService:
                 return replay
             self._person(pid)
             message = self.conn.execute(
-                "SELECT 1 FROM gmail_messages WHERE person_id=? AND message_id=? AND direction='inbound'",
-                (pid, message_id),
+                "SELECT 1 FROM gmail_messages WHERE user_id = %s AND person_id=%s AND message_id=%s AND direction='inbound'",
+                (self.user_id, pid, message_id),
             ).fetchone()
             if not message:
                 raise TaskNotFound("unknown inbound message")
             self.conn.execute(
-                "INSERT OR IGNORE INTO crm_review_dismissals VALUES(?,?)",
-                (pid, message_id),
+                "INSERT INTO crm_review_dismissals(user_id,person_id,message_id) VALUES(%s,%s,%s)"
+                " ON CONFLICT DO NOTHING",
+                (self.user_id, pid, message_id),
             )
             return self._record(
                 pid,
@@ -1110,15 +1121,16 @@ class CrmService:
         from coworker.crm_mail_repository import MailRepository
 
         today = today_in(timezone, now=now).isoformat()
-        with self.people._lock:
+        with self.people.transaction():
             board = self.people.list_board()
             # Batch relationship-wide reads. Opening Contacts never runs a model
             # or performs a task/proposal query for every visible row.
             hidden = False
             tasks_by_person: dict[str, list[dict[str, Any]]] = {}
             for task_row in self.conn.execute("""SELECT t.* FROM person_tasks t
-                    JOIN people p ON p.person_id=t.person_id WHERE t.state='open' AND p.deleted_at IS NULL
-                    ORDER BY t.due_date IS NULL,t.due_date,t.created_at,t.task_id"""):
+                    JOIN people p ON p.user_id=t.user_id AND p.person_id=t.person_id
+                    WHERE t.user_id=%s AND t.state='open' AND p.deleted_at IS NULL
+                    ORDER BY t.due_date IS NULL,t.due_date,t.created_at,t.task_id""", (self.user_id,)):
                 task = self.tasks._task_dict(task_row)
                 if not sources_visible(
                     self.people,
@@ -1138,12 +1150,14 @@ class CrmService:
             proposal_counts = {
                 row[0]: row[1]
                 for row in self.conn.execute(
-                    "SELECT person_id,count(*) FROM crm_proposals WHERE state='pending' GROUP BY person_id"
+                    "SELECT person_id,count(*) FROM crm_proposals WHERE user_id=%s AND state='pending' GROUP BY person_id",
+                    (self.user_id,),
                 )
             }
             ambiguous = set()
             for gap in self.conn.execute(
-                "SELECT person_id,fields_json FROM person_attachments WHERE record_type='knowledge_gap'"
+                "SELECT person_id,fields_json FROM person_attachments WHERE user_id=%s AND record_type='knowledge_gap'",
+                (self.user_id,),
             ):
                 fields = json.loads(gap[1])
                 if fields.get("kind") == "unassigned_reply" and not fields.get(
@@ -1153,12 +1167,13 @@ class CrmService:
             dismissed = {
                 (row[0], row[1])
                 for row in self.conn.execute(
-                    "SELECT person_id,message_id FROM crm_review_dismissals"
+                    "SELECT person_id,message_id FROM crm_review_dismissals WHERE user_id=%s",
+                    (self.user_id,),
                 )
             }
             analysis = {
                 row["person_id"]: MailRepository.analysis_projection(dict(row))
-                for row in self.conn.execute("SELECT * FROM crm_analysis_state")
+                for row in self.conn.execute("SELECT * FROM crm_analysis_state WHERE user_id=%s", (self.user_id,))
             }
             rows = []
             candidates = [*board["open"], *board["in_conversation"], *board["done"]]

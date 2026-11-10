@@ -1,7 +1,6 @@
 """Approval identity freshness is monotonic and independent of unrelated CRM edits."""
 import json
 
-from coworker import migrations
 from coworker.crm_tasks import TaskService
 from coworker.people import PersonStore
 
@@ -36,8 +35,8 @@ def test_keep_patch_and_revert_share_monotonic_identity_revision(tmp_path):
         actor='director',rationale_summary='Restore original identity')
     assert restored['identity_revision']==3
     assert restored['first_name']=='Ada'
-    history=json.loads(people._conn.execute('SELECT person_json FROM person_versions WHERE person_id=? AND version=?',
-        (pid,restored['version'])).fetchone()[0])
+    history=json.loads(people._conn.execute('SELECT person_json FROM person_versions WHERE user_id = %s AND person_id=%s AND version=%s',
+        (people._user_id,pid,restored['version'])).fetchone()[0])
     assert history['identity_revision']==3
 
 
@@ -48,20 +47,3 @@ def test_unrelated_task_description_and_status_edits_do_not_stale_approval_ident
         actor='director',rationale_summary='Save notes')
     people.set_sequence(pid,'open',actor='director')
     assert people.get(pid)['identity_revision']==0
-
-
-def test_schema_8_upgrades_with_backup_without_constructor_rewriting_identity(tmp_path):
-    people=PersonStore(tmp_path);pid=keep(people)['person_id']
-    if 'identity_revision' in {r[1] for r in people._conn.execute('PRAGMA table_info(people)')}:
-        people._conn.execute('ALTER TABLE people DROP COLUMN identity_revision')
-    people._conn.execute('PRAGMA user_version=8');people._conn.commit();people._conn.close()
-    old=PersonStore(tmp_path)
-    assert 'identity_revision' not in {r[1] for r in old._conn.execute('PRAGMA table_info(people)')}
-    old._conn.close()
-    result=migrations.apply_migrations(tmp_path)
-    assert result.error is None,result
-    current=PersonStore(tmp_path)
-    assert current._conn.execute('PRAGMA user_version').fetchone()[0]==10
-    assert current.get(pid)['identity_revision']==0
-    assert current.apply_enrichment(pid,email='new@example.test')['identity_revision']==1
-    assert result.backup_id is not None

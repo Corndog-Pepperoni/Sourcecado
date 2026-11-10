@@ -35,9 +35,9 @@ def _saved_mail(people: Any, pid: str, support: dict, evidence: Any, allowed: se
     mailbox_fields = ('from',) if support['direction'] == 'outbound' else ('to', 'cc', 'delivered_to')
     accounts = {address.casefold() for _name, address in getaddresses(
         [str(meta[field]) for field in mailbox_fields if meta.get(field)])}
-    rows = people._conn.execute("""SELECT * FROM gmail_messages WHERE person_id=? AND message_id=?
-        AND thread_id=? AND direction=? AND body_state='present'""",
-        (pid, support['message_id'], meta.get('thread_id'), support['direction'])).fetchall()
+    rows = people._conn.execute("""SELECT * FROM gmail_messages WHERE user_id = %s AND person_id=%s AND message_id=%s
+        AND thread_id=%s AND direction=%s AND body_state='present'""",
+        (people._user_id, pid, support['message_id'], meta.get('thread_id'), support['direction'])).fetchall()
     rows = [dict(row) for row in rows if row['account'].casefold() in accounts]
     if len(rows) != 1:
         return None
@@ -45,7 +45,7 @@ def _saved_mail(people: Any, pid: str, support: dict, evidence: Any, allowed: se
     if not saved['fingerprint'] or _body_digest(saved['body']) != support['body_fingerprint']:
         return None
     aliases = people._conn.execute("""SELECT * FROM person_attachments
-        WHERE person_id=? AND record_type='source_ref'""", (pid,)).fetchall()
+        WHERE user_id = %s AND person_id=%s AND record_type='source_ref'""", (people._user_id, pid)).fetchall()
     selected = None
     for row in aliases:
         fields = json.loads(row['fields_json'])
@@ -66,8 +66,8 @@ def legacy_decision(people: Any, pid: str, *, kind: str, value: dict,
                     allowed: set[str] | None = None) -> tuple[bool, list[str]]:
     """Return seen/pending ids without copying legacy content into a new record."""
     permitted = set(allowed or ())
-    if not people._conn.execute('SELECT 1 FROM crm_interpretations WHERE person_id=? LIMIT 1', (pid,)).fetchone() and not people._conn.execute(
-        "SELECT 1 FROM crm_proposals WHERE person_id=? AND intent_key LIKE 'legacy:%' LIMIT 1", (pid,)).fetchone():
+    if not people._conn.execute('SELECT 1 FROM crm_interpretations WHERE user_id = %s AND person_id=%s LIMIT 1', (people._user_id, pid)).fetchone() and not people._conn.execute(
+        "SELECT 1 FROM crm_proposals WHERE user_id = %s AND person_id=%s AND intent_key LIKE 'legacy:%%' LIMIT 1", (people._user_id, pid)).fetchone():
         return False, []
     if kind == 'description':
         support = evidence.manifest  # The old identity covered the whole conversation.
@@ -90,11 +90,11 @@ def legacy_decision(people: Any, pid: str, *, kind: str, value: dict,
     fingerprints = [item['fingerprint'] for item in saved]
     fingerprint = _fingerprint({'kind': kind, 'intent': identity, 'message': message,
         'evidence': sorted(fingerprints) if kind == 'description' else fingerprints[0]})
-    seen = people._conn.execute('SELECT 1 FROM crm_interpretations WHERE person_id=? AND fingerprint=?',
-        (pid, fingerprint)).fetchone() is not None
+    seen = people._conn.execute('SELECT 1 FROM crm_interpretations WHERE user_id = %s AND person_id=%s AND fingerprint=%s',
+        (people._user_id, pid, fingerprint)).fetchone() is not None
     rows = people._conn.execute("""SELECT proposal_id,state,source_refs FROM crm_proposals
-        WHERE person_id=? AND intent_key LIKE 'legacy:%' AND support_source_fingerprint=?""",
-        (pid, fingerprint)).fetchall()
+        WHERE user_id = %s AND person_id=%s AND intent_key LIKE 'legacy:%%' AND support_source_fingerprint=%s""",
+        (people._user_id, pid, fingerprint)).fetchall()
     for row in rows:
         source_ids(people, pid, json.loads(row['source_refs']), permitted)
     return seen or bool(rows), [row['proposal_id'] for row in rows if row['state'] == 'pending']

@@ -100,7 +100,8 @@ def test_complete_mail_writes_both_slots_and_checkpoint_survives_restart(tmp_pat
     replay = asyncio.run(worker(reopened, model).analyze(pid))
     assert replay["status"] == "unchanged"
     assert len(model.calls) == 1
-    assert len(reopened._conn.execute("SELECT * FROM crm_changes WHERE entity_type = 'description'").fetchall()) == 2
+    with reopened.transaction():
+        assert len(reopened._conn.execute("SELECT * FROM crm_changes WHERE user_id = %s AND entity_type = 'description'", (reopened._user_id,)).fetchall()) == 2
 
 
 def test_human_blank_gets_durable_proposal_and_accept_retains_protection(tmp_path):
@@ -257,7 +258,7 @@ def test_forged_model_refs_and_tool_calls_never_write(tmp_path):
     assert asyncio.run(worker(people, model).analyze(pid))["failure_code"] == "invalid_model_output"
     assert people.descriptions(pid)["general"]["text"] is None
     assert not worker(people).proposals(pid)
-    assert people._conn.execute("SELECT count(*) FROM crm_changes WHERE entity_type='description'").fetchone()[0] == 0
+    assert people._conn.execute("SELECT count(*) FROM crm_changes WHERE user_id = %s AND entity_type='description'", (people._user_id,)).fetchone()[0] == 0
 
 
 def test_email_instructions_remain_sealed_evidence_and_cannot_choose_person(tmp_path):
@@ -278,8 +279,8 @@ def test_permission_revocation_during_model_request_preserves_both_slots(tmp_pat
     pid = tracked_person(people)
     def revoke():
         ref = people.get(pid, expand_sources=True)["sources"][0]
-        with people._lock, people._conn:
-            people._conn.execute("UPDATE person_attachments SET restricted=1 WHERE id=?", (ref["id"],))
+        with people.transaction():
+            people._conn.execute("UPDATE person_attachments SET restricted=1 WHERE user_id = %s AND id=%s", (people._user_id, ref["id"]))
     model = DescriptionModel(before=revoke)
     assert asyncio.run(worker(people, model).analyze(pid))["status"] == "partial"
     assert people.descriptions(pid)["general"]["text"] is None
@@ -313,8 +314,8 @@ def test_atomic_commit_rolls_back_first_slot_if_second_slot_fails(tmp_path, monk
     monkeypatch.setattr(people, "_patch_description_uncommitted", fail_second)
     assert asyncio.run(worker(people).analyze(pid))["status"] == "failed"
     assert people.descriptions(pid)["general"]["text"] is None
-    assert people._conn.execute("SELECT count(*) FROM crm_proposals").fetchone()[0] == 0
-    assert people._conn.execute("SELECT count(*) FROM crm_changes WHERE entity_type='description'").fetchone()[0] == 0
+    assert people._conn.execute("SELECT count(*) FROM crm_proposals WHERE user_id = %s", (people._user_id,)).fetchone()[0] == 0
+    assert people._conn.execute("SELECT count(*) FROM crm_changes WHERE user_id = %s AND entity_type='description'", (people._user_id,)).fetchone()[0] == 0
     state = worker(PersonStore(tmp_path)).state(pid)
     assert state["analyzed_revision"] == 0
 
@@ -540,10 +541,45 @@ def test_new_durable_input_revision_during_generation_cannot_be_checkpointed_as_
     people = PersonStore(tmp_path)
     pid = tracked_person(people)
     def advance_revision():
-        with people._lock, people._conn:
-            people._conn.execute("UPDATE crm_analysis_state SET latest_revision=latest_revision+1, evidence_fingerprint='new-evidence' WHERE person_id=?", (pid,))
+        with people.transaction():
+            people._conn.execute("UPDATE crm_analysis_state SET latest_revision=latest_revision+1, evidence_fingerprint='new-evidence' WHERE user_id = %s AND person_id=%s", (people._user_id, pid))
     model = DescriptionModel(before=advance_revision)
     result = asyncio.run(worker(people, model).analyze(pid))
     assert result["status"] == "pending"
     assert people.descriptions(pid)["general"]["text"] is None
     assert worker(people).state(pid)["latest_revision"] != worker(people).state(pid)["analyzed_revision"]
+
+
+def test_snapshot_restore_retains_description_authority_and_sources(tmp_path):
+    people = PersonStore(tmp_path)
+    pid = tracked_person(people)
+    asyncio.run(worker(people).analyze(pid))
+    saved = people.descriptions(pid)
+    version = people.get(pid)["version"]
+    people.patch_description(pid, "general", expected_version=1, text="", actor="director", rationale_summary="Intentional blank")
+    people.revert(pid, to_version=version, expected_version=people.get(pid)["version"], actor="director", rationale_summary="Restore sourced descriptions")
+    restored = people.descriptions(pid)
+    for slot in saved:
+        assert {key:value for key,value in restored[slot].items() if key!='version'} == {key:value for key,value in saved[slot].items() if key!='version'}
+    assert restored['general']['version']==saved['general']['version']+2
+    assert restored['detailed']['version']==saved['detailed']['version']
+    # Generated prose and its authority/source metadata travel together.
+    assert restored["general"]["source_refs"] and restored["general"]["authority"] == "assistant"
+
+
+def test_description_write_survives_a_restart_and_replays(tmp_path):
+    people = PersonStore(tmp_path)
+    pid = tracked_person(people)
+    kwargs = dict(expected_version=0, text="A saved human overview.", actor="director",
+                  rationale_summary="Save the overview.", operation_id="test-fresh-edit")
+    saved = people.patch_description(pid, "general", **kwargs)
+    reopened = PersonStore(tmp_path)
+    assert reopened.descriptions(pid)["general"]["text"] == "A saved human overview."
+    replay = reopened.patch_description(pid, "general", **kwargs)
+    assert replay["replayed"] and replay["change"]["change_id"] == saved["change"]["change_id"]
+    with reopened.transaction():
+        count = reopened._conn.execute(
+            "SELECT count(*) FROM crm_changes WHERE user_id = %s AND entity_type='description'",
+            (reopened._user_id,),
+        ).fetchone()[0]
+    assert count == 1

@@ -68,7 +68,6 @@ class ConsequentialActions:
         self.agent_runs, self.sync_title = agent_runs, sync_title
 
     def _person(self, person_id, session_id):
-        self.people.require_crm_schema()
         person = self.people.get(person_id) if person_id else None
         if person is None:
             raise ActionRefused('person_not_found', 'The selected person is unavailable.', 404)

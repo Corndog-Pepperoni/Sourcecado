@@ -3,7 +3,6 @@
 from __future__ import annotations
 import asyncio
 import time
-from coworker.people import CrmMigrationRequired
 
 
 class AnalysisMaintenance:
@@ -13,42 +12,44 @@ class AnalysisMaintenance:
 
     def retry(self, pid):
         service = self.factory()
-        service._require_schema()
         service._prepare(pid)
         with self.people.crm_transaction() as conn:
             conn.execute(
-                "UPDATE crm_analysis_state SET attempts=0,next_retry_at=NULL,failure_code=NULL WHERE person_id=?",
-                (pid,),
+                "UPDATE crm_analysis_state SET attempts=0,next_retry_at=NULL,failure_code=NULL WHERE user_id = %s AND person_id=%s",
+                (self.people._user_id, pid),
             )
 
     def recover_interrupted(self):
         self._lock = asyncio.Lock()
-        self.people.require_crm_schema()
         with self.people.crm_transaction() as conn:
             conn.execute(
-                "UPDATE crm_analysis_attempts SET outcome='interrupted',failure_code='interrupted',updated_at=? WHERE outcome='running'",
-                (self.people._now(),),
+                "UPDATE crm_analysis_attempts SET outcome='interrupted',failure_code='interrupted',updated_at=%s WHERE user_id = %s AND outcome='running'",
+                (self.people._now(), self.people._user_id),
             )
             conn.execute(
-                "UPDATE crm_analysis_state SET lease_token=NULL,lease_until=NULL,outcome='pending' WHERE lease_token IS NOT NULL"
+                "UPDATE crm_analysis_state SET lease_token=NULL,lease_until=NULL,outcome='pending' WHERE user_id = %s AND lease_token IS NOT NULL",
+                (self.people._user_id,),
             )
 
     def retry_delay(self):
-        with self.people._lock:
+        with self.people.transaction():
             row = self.people._conn.execute(
-                "SELECT min(next_retry_at) FROM crm_analysis_state WHERE latest_revision!=analyzed_revision AND attempts<3"
+                "SELECT min(next_retry_at) FROM crm_analysis_state WHERE user_id = %s AND latest_revision!=analyzed_revision AND attempts<3",
+                (self.people._user_id,),
             ).fetchone()
         return max(1.0, min(300.0, row[0] - time.time())) if row and row[0] else 300.0
 
     async def run_pending(self):
         async with self._lock:
             service = self.factory()
-            service._require_schema()
-            with self.people._lock:
+            with self.people.transaction():
                 changed = [
                     r[0]
                     for r in self.people._conn.execute(
-                        "SELECT s.person_id FROM crm_analysis_state s JOIN people p ON p.person_id=s.person_id WHERE p.deleted_at IS NULL AND latest_evidence_revision>observed_collection_revision ORDER BY s.updated_at LIMIT 100"
+                        "SELECT s.person_id FROM crm_analysis_state s JOIN people p ON p.user_id=s.user_id AND p.person_id=s.person_id"
+                        " WHERE s.user_id = %s AND p.deleted_at IS NULL AND latest_evidence_revision>observed_collection_revision"
+                        " ORDER BY s.updated_at LIMIT 100",
+                        (self.people._user_id,),
                     )
                 ]
             for pid in changed:
@@ -93,10 +94,7 @@ class RefreshCoordinator:
 
     async def run(self):
         self._wake = asyncio.Event()
-        try:
-            self.analysis.recover_interrupted()
-        except CrmMigrationRequired:
-            return  # Manual analysis reports the typed repair requirement; never spend on an old schema.
+        self.analysis.recover_interrupted()
         loop = asyncio.get_running_loop()
         next_collection = 0.0
         try:

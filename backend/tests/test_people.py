@@ -181,11 +181,11 @@ def test_person_with_no_sequence_is_on_the_board_backlog(tmp_path):
 def test_unknown_legacy_sequence_appears_in_backlog_without_outreach(tmp_path):
     store = PersonStore(tmp_path)
     person = _ada(store)
-    store._conn.execute(
-        "UPDATE people SET sequence_state = 'kept' WHERE person_id = ?",
-        (person["person_id"],),
-    )
-    store._conn.commit()
+    with store.transaction():
+        store._conn.execute(
+            "UPDATE people SET sequence_state = 'kept' WHERE user_id = %s AND person_id = %s",
+            (store._user_id, person["person_id"]),
+        )
 
     row = store.list_board()["backlog"][0]
 

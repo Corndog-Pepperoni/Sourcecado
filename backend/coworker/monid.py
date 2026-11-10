@@ -228,8 +228,8 @@ class MonidResearchActions:
 
     def approval_resource(self, args, session_id, *, check_expiry=True):
         qid = args.get("quote_id") if isinstance(args, dict) else None
-        with self.people._lock:
-            row = self.people._conn.execute("SELECT fields_json FROM person_attachments WHERE record_type='artifact' AND idempotency_key=?", (qid,)).fetchone()
+        with self.people.transaction():
+            row = self.people._conn.execute("SELECT fields_json FROM person_attachments WHERE user_id = %s AND record_type='artifact' AND idempotency_key=%s", (self.people._user_id, qid)).fetchone()
         fields = json.loads(row[0]) if row else {}
         quote = fields.get("quote")
         if fields.get("artifact_type") != "monid_quote" or not isinstance(quote, dict):
@@ -270,11 +270,11 @@ class MonidResearchActions:
                 raise MonidError("The endpoint or price changed. Review a new quote before spending.")
             with self.people.crm_transaction() as conn:
                 key = f"monid:dispatch:{quote['quote_id']}"
-                if conn.execute("SELECT 1 FROM events WHERE external_key=?", (key,)).fetchone():
+                if conn.execute("SELECT 1 FROM events WHERE user_id = %s AND external_key=%s", (self.people._user_id, key)).fetchone():
                     raise MonidError("This quote was already attempted. It cannot start another paid run.")
-                conn.execute("""INSERT INTO events(event_id,person_id,external_key,source,kind,summary,payload,actor,session_id,run_id,tool)
-                    VALUES(?,?,?,'sourcecado','research_dispatch','Approved Monid lookup dispatched',?,'director',?,?,'monid_research')""",
-                    ("event_"+secrets.token_hex(16), quote["person_id"], key, json.dumps({"quote_id":quote["quote_id"],"approval_id":approval_id,"outcome":"unknown"}),session_id,run_id))
+                conn.execute("""INSERT INTO events(user_id,event_id,person_id,external_key,source,kind,summary,payload,actor,session_id,run_id,tool)
+                    VALUES(%s,%s,%s,%s,'sourcecado','research_dispatch','Approved Monid lookup dispatched',%s,'director',%s,%s,'monid_research')""",
+                    (self.people._user_id, "event_"+secrets.token_hex(16), quote["person_id"], key, json.dumps({"quote_id":quote["quote_id"],"approval_id":approval_id,"outcome":"unknown"}),session_id,run_id))
             dispatched = True
             result = self._request("POST", "/v1/run", payload={"provider": quote["provider"], "endpoint": quote["endpoint"], "input": quote["input"]},
                                    paid=True, expected_credential=quote["credential_fingerprint"])

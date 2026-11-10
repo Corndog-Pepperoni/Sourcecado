@@ -160,7 +160,7 @@ def test_ambiguous_non_id_match_refuses_before_approval_or_credit_spend(tmp_path
     people=app.state.people
     # Model a manually retained identity without the original provider identifier.
     with people.crm_transaction():
-        people._conn.execute('UPDATE people SET apollo_id=NULL WHERE person_id=?',(pid,))
+        people._conn.execute('UPDATE people SET apollo_id=NULL WHERE user_id = %s AND person_id=%s',(people._user_id,pid))
     person=people.get(pid)
     other=people.keep_from_apollo(apollo_id=None,first_name=person['first_name'] if shared=='name' else 'Other',
         last_name_obfuscated=person['last_name'] if shared=='name' else 'Person',title=None,company=person['company'])

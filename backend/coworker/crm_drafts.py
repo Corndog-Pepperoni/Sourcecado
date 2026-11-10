@@ -42,8 +42,8 @@ async def prepare_task_draft(
         if not proposal:
             return crm.tasks.get(person_id, task_id)
         row = people._conn.execute(
-            "SELECT * FROM crm_proposals WHERE person_id=? AND proposal_id=? AND state='pending'",
-            (person_id, task_id),
+            "SELECT * FROM crm_proposals WHERE user_id = %s AND person_id=%s AND proposal_id=%s AND state='pending'",
+            (people._user_id, person_id, task_id),
         ).fetchone()
         if row is None:
             raise TaskConflict(
@@ -64,7 +64,7 @@ async def prepare_task_draft(
         }
 
     def validate_current_sources():
-        with people._lock:
+        with people.transaction():
             refs = source_ids(people, person_id, current_task()["source_refs"], set())
             fields = {
                 ref["id"]: ref["fields"]
@@ -73,8 +73,8 @@ async def prepare_task_draft(
             }
             mids = {fields[sid].get("message_id") for sid in refs}
             for row in people._conn.execute(
-                "SELECT fields_json,restricted FROM person_attachments WHERE person_id=? AND record_type='source_ref'",
-                (person_id,),
+                "SELECT fields_json,restricted FROM person_attachments WHERE user_id = %s AND person_id=%s AND record_type='source_ref'",
+                (people._user_id, person_id),
             ):
                 if (
                     row["restricted"]
@@ -82,7 +82,7 @@ async def prepare_task_draft(
                 ):
                     raise TaskError("source is private")
 
-    with people._lock:
+    with people.transaction():
         replay = crm.tasks._replay(operation, fingerprint)
         if replay:
             return replay
@@ -107,23 +107,23 @@ async def prepare_task_draft(
             aliases = [
                 row
                 for row in people._conn.execute(
-                    "SELECT id,fields_json,restricted FROM person_attachments WHERE person_id=? AND record_type='source_ref'",
-                    (person_id,),
+                    "SELECT id,fields_json,restricted FROM person_attachments WHERE user_id = %s AND person_id=%s AND record_type='source_ref'",
+                    (people._user_id, person_id),
                 )
                 if json.loads(row["fields_json"]).get("message_id") == mid
             ]
             if any(row["restricted"] for row in aliases):
                 raise TaskError("source is private")
             rows = people._conn.execute(
-                "SELECT * FROM gmail_messages WHERE person_id=? AND message_id=? AND thread_id=?",
-                (person_id, mid, fields.get("thread_id")),
+                "SELECT * FROM gmail_messages WHERE user_id = %s AND person_id=%s AND message_id=%s AND thread_id=%s",
+                (people._user_id, person_id, mid, fields.get("thread_id")),
             ).fetchall()
             if len(rows) != 1:
                 continue
             row = dict(rows[0])
             event = people._conn.execute(
-                "SELECT payload FROM events WHERE person_id=? AND external_key=?",
-                (person_id, "gmail:message:" + str(mid)),
+                "SELECT payload FROM events WHERE user_id = %s AND person_id=%s AND external_key=%s",
+                (people._user_id, person_id, "gmail:message:" + str(mid)),
             ).fetchone()
             if not event:
                 continue
@@ -230,9 +230,9 @@ async def prepare_task_draft(
             "title": value["subject"],
         }
         conn.execute(
-            """INSERT INTO person_attachments(id,person_id,record_type,idempotency_key,fields_json,restricted,created_at,updated_at)
-            VALUES(?,?,'artifact',?,?,0,?,?)""",
-            (artifact_id, person_id, operation, json.dumps(value), now, now),
+            """INSERT INTO person_attachments(user_id,id,person_id,record_type,idempotency_key,fields_json,restricted,created_at,updated_at)
+            VALUES(%s,%s,%s,'artifact',%s,%s,0,%s,%s)""",
+            (people._user_id, artifact_id, person_id, operation, json.dumps(value), now, now),
         )
         return crm._record(
             person_id,

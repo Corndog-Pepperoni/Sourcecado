@@ -4,11 +4,12 @@ These are policy/regression proofs, not a measure of live model precision.
 """
 import asyncio
 import json
-import sqlite3
 
+import psycopg
 import pytest
 from fastapi.testclient import TestClient
 
+from coworker.people_db import Tx
 from coworker.crm_tasks import TaskConflict, TaskError, TaskService
 from coworker.people import PersonStore
 from coworker.provider import StreamChunk
@@ -170,7 +171,7 @@ def test_two_promises_in_one_sentence_get_distinct_canonical_support(tmp_path):
     service, result = run(people, pid, [candidate(first), candidate(second, title="Share student examples")], TaskMail(body))
     assert result["status"] == "analyzed"
     assert {(t["title"], t["due_date"]) for t in saved_tasks(people, pid)} == {("Send project proposal", "2026-10-23"), ("Share student examples", "2026-10-19")}
-    assert people._conn.execute("SELECT count(DISTINCT request_start) FROM crm_task_evidence").fetchone()[0] == 2
+    assert people._conn.execute("SELECT count(DISTINCT request_start) FROM crm_task_evidence WHERE user_id = %s", (people._user_id,)).fetchone()[0] == 2
 
 
 def add_unrelated_mail(people, pid):
@@ -311,19 +312,32 @@ def test_missing_task_stage_output_fails_without_checkpoint_or_description_write
     assert service.state(pid)["latest_revision"] != service.state(pid)["analyzed_revision"]
 
 
-def test_task_proposal_acceptance_replay_stale_target_and_atomic_failure(tmp_path):
+def fail_statement(monkeypatch, matches, message="simulated failure"):
+    """Make every store statement for which `matches(sql, params)` is true fail."""
+    original = Tx.execute
+
+    def execute(self, query, params=()):
+        if matches(" ".join(query.split()), tuple(params)):
+            raise psycopg.errors.IntegrityError(message)
+        return original(self, query, params)
+
+    monkeypatch.setattr(Tx, "execute", execute)
+    return lambda: monkeypatch.setattr(Tx, "execute", original)
+
+
+def test_task_proposal_acceptance_replay_stale_target_and_atomic_failure(tmp_path, monkeypatch):
     people = PersonStore(tmp_path)
     pid = tracked_person(people)
     request = "It would be nice to see the project proposal sometime."
     service, _ = run(people, pid, [candidate(request)], TaskMail(request + " We want to discuss the engineering projects with your infrastructure team."))
     proposal = service.proposals(pid)[0]
-    people._conn.execute("""CREATE TRIGGER fail_task_resolution BEFORE UPDATE OF resolution_receipt_json ON crm_proposals
-        BEGIN SELECT RAISE(ABORT, 'after task creation'); END""")
-    with pytest.raises(sqlite3.IntegrityError):
+    restore = fail_statement(monkeypatch, lambda sql, params: sql.startswith("UPDATE crm_proposals") and "resolution_receipt_json" in sql,
+        "after task creation")
+    with pytest.raises(psycopg.errors.IntegrityError):
         service.resolve(pid, proposal["proposal_id"], action="accept", expected_version=1)
     assert saved_tasks(people, pid) == []
     assert service.proposals(pid)[0]["state"] == "pending"
-    people._conn.execute("DROP TRIGGER fail_task_resolution")
+    restore()
     saved = service.resolve(pid, proposal["proposal_id"], action="accept", expected_version=1)
     assert len(saved_tasks(people, pid)) == 1
     assert saved_tasks(people, pid)[0]["origin"] == "human"
@@ -345,22 +359,21 @@ def test_generic_thanks_and_unbound_send_never_complete_task(tmp_path, text):
 
 
 @pytest.mark.parametrize("fail_at", ["task", "proposal", "checkpoint"])
-def test_analysis_rolls_back_descriptions_tasks_proposals_and_receipts_together(tmp_path, fail_at):
+def test_analysis_rolls_back_descriptions_tasks_proposals_and_receipts_together(tmp_path, fail_at, monkeypatch):
     people = PersonStore(tmp_path)
     pid = tracked_person(people)
-    trigger = {
-        "task": "BEFORE INSERT ON person_tasks",
-        "proposal": "BEFORE INSERT ON crm_proposals WHEN NEW.target_kind='task_create'",
-        "checkpoint": "BEFORE UPDATE OF analyzed_revision ON crm_analysis_state WHEN NEW.analyzed_revision > OLD.analyzed_revision",
+    fails = {
+        "task": lambda sql, params: sql.startswith("INSERT INTO person_tasks"),
+        "proposal": lambda sql, params: sql.startswith("INSERT INTO crm_proposals") and "task_create" in params,
+        "checkpoint": lambda sql, params: sql.startswith("UPDATE crm_analysis_state") and "analyzed_revision=CASE" in sql and params[0] == "analyzed",
     }[fail_at]
-    people._conn.execute(f"CREATE TRIGGER fail_analysis {trigger} BEGIN SELECT RAISE(ABORT, 'simulated failure'); END")
+    fail_statement(monkeypatch, fails)
     service, result = run(people, pid)
     assert result["status"] == "failed"
     assert saved_tasks(people, pid) == []
     assert people.descriptions(pid)["general"]["text"] is None
-    assert people._conn.execute("SELECT count(*) FROM crm_proposals").fetchone()[0] == 0
-    assert people._conn.execute("SELECT count(*) FROM crm_changes").fetchone()[0] == 0
-    assert people._conn.execute("SELECT count(*) FROM crm_operations").fetchone()[0] == 0
+    for table in ("crm_proposals", "crm_changes", "crm_operations"):
+        assert people._conn.execute(f"SELECT count(*) FROM {table} WHERE user_id = %s", (people._user_id,)).fetchone()[0] == 0
     assert service.state(pid)["latest_revision"] != service.state(pid)["analyzed_revision"]
 
 
@@ -431,8 +444,8 @@ def test_task_source_links_are_safe_current_and_shared_by_http_and_chat(tmp_path
         ok, chat = execute_crm_tool("crm_list_tasks", {}, people=people, session_id="email-tasks-chat")
         assert ok and chat["tasks"][0]["source_links"] == person_tasks[0]["source_links"]
         ref = person_tasks[0]["source_refs"][0]
-        with people._lock, people._conn:
-            people._conn.execute("UPDATE person_attachments SET restricted=1 WHERE id=?", (ref,))
+        with people.transaction():
+            people._conn.execute("UPDATE person_attachments SET restricted=1 WHERE user_id = %s AND id=%s", (people._user_id, ref))
         assert client.get(f"/v1/crm/tasks?person_id={pid}", headers={TOKEN_HEADER: "email-tasks"}).json()["tasks"] == []
         history = client.get(f"/v1/people/{pid}/tasks/{person_tasks[0]['task_id']}/changes", headers={TOKEN_HEADER: "email-tasks"})
         assert history.status_code in {400, 404}
@@ -461,3 +474,30 @@ def test_runtime_chat_can_undo_automatic_creation_once_with_director_authority(t
     assert not results[2]["ok"]
     assert TaskService(people).get(pid, extra["task"]["task_id"])["state"] == "open"
     assert worker(PersonStore(tmp_path)).proposals(pid, state="dismissed")
+
+
+def test_person_snapshot_revert_preserves_independent_inferred_work(tmp_path):
+    people = PersonStore(tmp_path)
+    pid = tracked_person(people)
+    before_analysis = people.get(pid)["version"]
+    service = worker(people, TaskModel(), TaskMail())
+    assert asyncio.run(service.analyze(pid))["status"] == "analyzed"
+    task = saved_tasks(people, pid)[0]
+
+    def evidence():
+        with people.transaction():
+            return [tuple(r) for r in people._conn.execute(
+                "SELECT * FROM crm_task_evidence WHERE user_id = %s ORDER BY proposal_id", (people._user_id,))]
+
+    def attachment_ids():
+        with people.transaction():
+            return {r[0] for r in people._conn.execute(
+                "SELECT id FROM person_attachments WHERE user_id = %s", (people._user_id,))}
+
+    recorded = evidence()
+    changes = TaskService(people).changes(task["task_id"])
+    people.revert(pid, to_version=before_analysis, expected_version=people.get(pid)["version"], actor="director", rationale_summary="Restore an earlier person file.")
+    assert saved_tasks(people, pid) == [task]
+    assert evidence() == recorded
+    assert TaskService(people).changes(task["task_id"]) == changes
+    assert task["source_refs"][0] in attachment_ids()

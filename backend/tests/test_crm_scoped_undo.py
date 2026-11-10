@@ -78,8 +78,8 @@ def test_accepted_creation_undo_cancels_exact_task_and_suppresses_proposal(tmp_p
     assert TaskService(p).get(pid, unrelated["task_id"])["state"] == "open"
     assert (
         p._conn.execute(
-            "SELECT state FROM crm_proposals WHERE proposal_id=?",
-            (proposal["proposal_id"],),
+            "SELECT state FROM crm_proposals WHERE user_id = %s AND proposal_id=%s",
+            (p._user_id, proposal["proposal_id"]),
         ).fetchone()[0]
         == "dismissed"
     )

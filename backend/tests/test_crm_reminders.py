@@ -76,8 +76,8 @@ def test_repeated_concurrent_saves_and_restart_return_the_same_task(tmp_path):
     restarted = _app(tmp_path, gmail)
     again = TestClient(restarted).post(path(pid, mid), headers=HEADERS, json=payload)
     assert again.status_code == 200 and again.json()["task"]["task_id"] in ids
-    assert restarted.state.people._conn.execute("SELECT count(*) FROM person_tasks").fetchone()[0] == 1
-    assert restarted.state.people._conn.execute("SELECT count(*) FROM crm_changes WHERE entity_type='task'").fetchone()[0] == 1
+    assert restarted.state.people._conn.execute("SELECT count(*) FROM person_tasks WHERE user_id = %s", (restarted.state.people._user_id,)).fetchone()[0] == 1
+    assert restarted.state.people._conn.execute("SELECT count(*) FROM crm_changes WHERE user_id = %s AND entity_type='task'", (restarted.state.people._user_id,)).fetchone()[0] == 1
     assert len(gmail.send_attempts) == 1
 
 
@@ -94,10 +94,10 @@ def test_a_changed_duplicate_save_conflicts_without_losing_the_original_task(tmp
 def test_invalid_date_and_failed_task_write_roll_back_the_source_and_allow_retry(tmp_path, monkeypatch):
     app, client, gmail, pid, mid = sent_message(tmp_path)
     payload = choice(client, pid, mid)
-    before = app.state.people._conn.execute("SELECT count(*) FROM person_attachments").fetchone()[0]
+    before = app.state.people._conn.execute("SELECT count(*) FROM person_attachments WHERE user_id = %s", (app.state.people._user_id,)).fetchone()[0]
     invalid = client.post(path(pid, mid), headers=HEADERS, json={**payload, "due_date": "2026-02-30"})
     assert invalid.status_code == 400
-    assert app.state.people._conn.execute("SELECT count(*) FROM person_attachments").fetchone()[0] == before
+    assert app.state.people._conn.execute("SELECT count(*) FROM person_attachments WHERE user_id = %s", (app.state.people._user_id,)).fetchone()[0] == before
     original = TaskService._create_uncommitted
 
     def fail_after_task(self, *args, **kwargs):
@@ -107,8 +107,8 @@ def test_invalid_date_and_failed_task_write_roll_back_the_source_and_allow_retry
     monkeypatch.setattr(TaskService, "_create_uncommitted", fail_after_task)
     failing = TestClient(app, raise_server_exceptions=False)
     assert failing.post(path(pid, mid), headers=HEADERS, json=payload).status_code == 503
-    assert app.state.people._conn.execute("SELECT count(*) FROM person_tasks").fetchone()[0] == 0
-    assert app.state.people._conn.execute("SELECT count(*) FROM person_attachments").fetchone()[0] == before
+    assert app.state.people._conn.execute("SELECT count(*) FROM person_tasks WHERE user_id = %s", (app.state.people._user_id,)).fetchone()[0] == 0
+    assert app.state.people._conn.execute("SELECT count(*) FROM person_attachments WHERE user_id = %s", (app.state.people._user_id,)).fetchone()[0] == before
     monkeypatch.undo()
     assert client.post(path(pid, mid), headers=HEADERS, json=payload).status_code == 201
     assert len(gmail.send_attempts) == 1

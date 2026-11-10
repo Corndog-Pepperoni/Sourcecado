@@ -1119,11 +1119,9 @@ def _check_run_links(
         if transcripts.is_dir():
             sessions |= {path.stem for path in transcripts.glob("*.jsonl")}
     approvals = _known_keys(root, "conversation_db", "SELECT id FROM inbox")
-    people = _known_keys(root, "people_db", "SELECT person_id FROM people")
 
     dangling_parents: list[str] = []
     dangling_sessions: list[str] = []
-    dangling_people: list[str] = []
     dangling_approvals: list[str] = []
     for run in runs:
         run_id = str(run.get("run_id"))
@@ -1133,9 +1131,6 @@ def _check_run_links(
         session = str(run.get("session_id") or "")
         if sessions is not None and session not in sessions:
             dangling_sessions.append(f"run {run_id} names session {session[:48]}")
-        person = run.get("person_id")
-        if people is not None and person is not None and str(person) not in people:
-            dangling_people.append(f"run {run_id} names person {str(person)[:48]}")
         if approvals is not None:
             for approval in json_list(run.get("approval_ids")):
                 if str(approval) not in approvals:
@@ -1147,7 +1142,6 @@ def _check_run_links(
     for check, entries, subject in (
         ("agent_run.orphaned_parent", dangling_parents, "a parent run"),
         ("agent_run.orphaned_session", dangling_sessions, "a session"),
-        ("agent_run.orphaned_person", dangling_people, "a person file"),
         ("agent_run.orphaned_approval", dangling_approvals, "an approval"),
     ):
         if entries:
@@ -1176,7 +1170,6 @@ def _check_run_links(
 
 def _check_links(collector: _Collector, root: Path) -> None:
     conversation = migrations.spec_for("conversation_db")
-    people = migrations.spec_for("people_db")
     if not store_present(root, conversation):
         return
     conn = open_readonly(store_path(root, conversation))
@@ -1285,50 +1278,6 @@ def _check_links(collector: _Collector, root: Path) -> None:
                 )
     finally:
         conn.close()
-
-    if not store_present(root, people):
-        return
-    conn = open_readonly(store_path(root, people))
-    try:
-        tables = migrations.table_names(conn)
-        if "session_people" in tables:
-            stranded = [
-                f"binding for session {str(row['session_id'])[:48]}"
-                for row in conn.execute("SELECT session_id FROM session_people")
-                if str(row["session_id"]) not in known
-            ]
-            if stranded:
-                collector.add(
-                    "person.orphaned_session_binding",
-                    people.store_id,
-                    Severity.WARN,
-                    Repair.REVIEW_REQUIRED,
-                    "Person bindings point at a session that no longer exists.",
-                    count=len(stranded),
-                    detail=stranded,
-                )
-        if {"events", "people"} <= tables:
-            orphans = [
-                f"event {str(row['event_id'])[:48]}"
-                for row in conn.execute(
-                    "SELECT event_id FROM events WHERE person_id NOT IN "
-                    "(SELECT person_id FROM people)"
-                )
-            ]
-            if orphans:
-                collector.add(
-                    "person.orphaned_event",
-                    people.store_id,
-                    Severity.WARN,
-                    Repair.REVIEW_REQUIRED,
-                    "Ledger events point at a person file that is gone. Person "
-                    "history is never deleted by Doctor.",
-                    count=len(orphans),
-                    detail=orphans,
-                )
-    finally:
-        conn.close()
-
 
 # --- diagnose ------------------------------------------------------------
 

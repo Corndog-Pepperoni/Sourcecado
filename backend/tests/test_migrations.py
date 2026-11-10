@@ -12,8 +12,6 @@ import pytest
 from coworker import migrations
 from coworker.agent_run_approval import EFFECT_STATEMENTS
 from coworker.migrations import (
-    CRM_CHANGES_REBUILD_FROM as REBUILD_FROM,
-    PEOPLE_DB_VERSION,
     BackupFailed,
     Migration,
     StoreKind,
@@ -21,7 +19,6 @@ from coworker.migrations import (
     VersionChannel,
 )
 from tests.state_fixtures import (
-    LEGACY_PERSON_ID,
     PLANTED_CANARIES,
     build_current_state,
     build_legacy_state,
@@ -110,7 +107,6 @@ def test_registry_names_every_active_durable_store():
     assert registered == {
         "agent_runs_db",
         "conversation_db",
-        "people_db",
         "drive_ingestion",
         "meeting_evidence",
         "conversation_transcripts",
@@ -129,7 +125,6 @@ def test_registry_names_every_active_durable_store():
 
 
 def test_registry_reuses_the_version_constant_owned_by_each_store_module():
-    from coworker.people import SCHEMA_VERSION as people_version
     from coworker.secrets import SCHEMA_VERSION as secrets_version
     from coworker.store import SCHEMA_VERSION as conversation_version
     from coworker.workspace import WorkspaceGrantStore
@@ -140,7 +135,6 @@ def test_registry_reuses_the_version_constant_owned_by_each_store_module():
 
     expected = {
         "conversation_db": conversation_version,
-        "people_db": people_version,
         "secrets": secrets_version,
         "workspace_receipts": receipts_version,
         "workspace_grants": WorkspaceGrantStore.VERSION,
@@ -247,207 +241,6 @@ def test_legacy_conversation_db_upgrades_from_the_pre_registry_shape(tmp_path):
         conn.close()
 
 
-def test_legacy_people_db_upgrades_from_the_pre_registry_shape(tmp_path):
-    root = build_legacy_state(tmp_path / "state")
-    db = root / "people.db"
-    assert _user_version(db) == 0
-
-    store_plan = _plan_for(migrations.plan_migrations(root), "people_db")
-    assert store_plan.status is StoreStatus.PENDING
-    assert store_plan.record_count > 0
-
-    assert migrations.apply_migrations(root).error is None
-    assert _user_version(db) == PEOPLE_DB_VERSION
-
-    conn = sqlite3.connect(db)
-    conn.row_factory = sqlite3.Row
-    try:
-        person = conn.execute(
-            "SELECT * FROM people WHERE person_id = ?", (LEGACY_PERSON_ID,)
-        ).fetchone()
-        assert person["first_name"] == "Dana"
-        assert person["version"] == 1
-        assert person["outcome"] is None
-        assert person["deleted_at"] is None
-        tables = {
-            str(row[0])
-            for row in conn.execute(
-                "SELECT name FROM sqlite_master WHERE type = 'table'"
-            ).fetchall()
-        }
-        assert {
-            "person_attachments",
-            "person_versions",
-            "person_descriptions",
-        } <= tables
-    finally:
-        conn.close()
-
-
-def test_people_v2_moves_masked_surnames_out_of_canonical_history(tmp_path):
-    from coworker.people import PersonStore
-    from coworker.store import ConversationStore
-
-    root = tmp_path / "state"
-    conversations = ConversationStore(root)
-    conversations.create_session("sourcing-fisher")
-    conversations.rename_session("sourcing-fisher", "Sourcing · Fisher Zh***g")
-    store = PersonStore(root)
-    person = store.keep_from_apollo(
-        apollo_id="apollo-fisher",
-        first_name="Fisher",
-        last_name_obfuscated="Zhang",
-        title="Building GTM AI",
-        company="The Hog",
-    )
-    store.bind_session("sourcing-fisher", person["person_id"])
-    event = store.append_event(
-        person["person_id"],
-        source="apollo",
-        kind="search",
-        summary="Kept from the Apollo shortlist",
-        actor="assistant",
-    )
-    snapshot = json.loads(
-        store._conn.execute(
-            "SELECT person_json FROM person_versions WHERE person_id = ? AND version = 1",
-            (person["person_id"],),
-        ).fetchone()[0]
-    )
-    snapshot["last_name"] = "Zh***g"
-    snapshot["handoff_who"] = "Fisher Zh***g"
-    snapshot.pop("last_name_status", None)
-    store._conn.execute(
-        "UPDATE people SET last_name = 'Zh***g', "
-        "apollo_last_name_obfuscated = NULL, handoff_who = 'Fisher Zh***g' "
-        "WHERE person_id = ?",
-        (person["person_id"],),
-    )
-    store._conn.execute(
-        "UPDATE person_versions SET person_json = ? WHERE person_id = ? AND version = 1",
-        (json.dumps(snapshot), person["person_id"]),
-    )
-    store._conn.execute("PRAGMA user_version = 1")
-    store._conn.commit()
-
-    plan = _plan_for(migrations.plan_migrations(root), "people_db")
-    assert plan.status is StoreStatus.PENDING
-    assert plan.from_version == 1
-    assert plan.to_version == PEOPLE_DB_VERSION
-
-    outcome = migrations.apply_migrations(root)
-
-    assert outcome.error is None
-    assert _user_version(root / "people.db") == PEOPLE_DB_VERSION
-    loaded = PersonStore(root).get(person["person_id"])
-    assert loaded is not None
-    assert loaded["person_id"] == person["person_id"]
-    assert loaded["apollo_id"] == "apollo-fisher"
-    assert loaded["last_name"] is None
-    assert loaded["last_name_status"] == "hidden_by_apollo"
-    assert loaded["handoff_who"] == "Fisher (surname hidden by Apollo)"
-    assert "Zh***g" not in str(loaded)
-    assert PersonStore(root).person_for_session("sourcing-fisher") == person["person_id"]
-    assert PersonStore(root).timeline(person["person_id"])[0]["event_id"] == event["event_id"]
-    migrated_conn = sqlite3.connect(root / "people.db")
-    try:
-        migrated_snapshot = json.loads(
-            migrated_conn.execute(
-                "SELECT person_json FROM person_versions "
-                "WHERE person_id = ? AND version = 1",
-                (person["person_id"],),
-            ).fetchone()[0]
-        )
-    finally:
-        migrated_conn.close()
-    assert migrated_snapshot["last_name"] is None
-    assert migrated_snapshot["last_name_status"] == "hidden_by_apollo"
-    assert migrated_snapshot["handoff_who"] == "Fisher (surname hidden by Apollo)"
-    assert "Zh***g" not in str(migrated_snapshot)
-    from coworker.server import TOKEN_HEADER, create_app
-    from fastapi.testclient import TestClient
-
-    app = create_app(token="migration-test-token", provider=None, state=root)
-    migrated_title = app.state.store.index("sourcing-fisher")["title"]
-    assert "Fisher" in migrated_title
-    assert "Zh***g" not in migrated_title
-    sessions = TestClient(app).get(
-        "/v1/sessions",
-        headers={TOKEN_HEADER: "migration-test-token"},
-    ).json()["sessions"]
-    title = next(
-        row["title"] for row in sessions if row["session_id"] == "sourcing-fisher"
-    )
-    assert "Fisher" in title
-    assert "Zh***g" not in title
-
-
-def test_people_v3_adds_the_description_table_to_an_existing_v2_database(tmp_path):
-    """An existing v2 people.db without person_descriptions is migrated, not
-    silently grown by a constructor probe (spec §8.3).
-
-    This is the reviewer's repro: a populated v2 database that predates the
-    description table must be reported PENDING, gain the table through the
-    registered 2->3 step with backup and rollback, and end at version 3 —
-    rather than having the table appear while user_version stays at 2.
-    """
-    from coworker.people import PersonStore
-
-    root = tmp_path / "state"
-    store = PersonStore(root)
-    person = store.keep_from_apollo(
-        apollo_id="apollo-desc",
-        first_name="Dana",
-        last_name_obfuscated="Reed",
-        title="Partner",
-        company="Codeology",
-    )
-    # Rewind to the real v2 shape: drop the table a v2 install never had and
-    # stamp the version back to 2.
-    for name in ("crm_proposals", "crm_analysis_attempts", "crm_analysis_state",
-                 "crm_operations", "crm_changes", "person_tasks", "person_descriptions"):
-        store._conn.execute(f"DROP TABLE {name}")
-    store._conn.execute("PRAGMA user_version = 2")
-    store._conn.commit()
-    store._conn.close()
-
-    db = root / "people.db"
-    assert "person_descriptions" not in migrations.table_names(
-        sqlite3.connect(db)
-    )
-
-    plan = _plan_for(migrations.plan_migrations(root), "people_db")
-    assert plan.status is StoreStatus.PENDING
-    assert plan.from_version == 2
-    assert plan.to_version == migrations.spec_for("people_db").current_version
-    assert [(step.from_version, step.to_version) for step in plan.steps][:2] == [(2, 3), (3, 4)]
-
-    outcome = migrations.apply_migrations(root)
-    assert outcome.error is None
-    assert outcome.backup_id is not None
-    assert _user_version(db) == migrations.spec_for("people_db").current_version
-
-    conn = sqlite3.connect(db)
-    conn.row_factory = sqlite3.Row
-    try:
-        assert "person_descriptions" in migrations.table_names(conn)
-        # The populated person and its slots survive the migration.
-        assert (
-            conn.execute(
-                "SELECT first_name FROM people WHERE person_id = ?",
-                (person["person_id"],),
-            ).fetchone()["first_name"]
-            == "Dana"
-        )
-    finally:
-        conn.close()
-
-    # Reopening the real store leaves the recorded version at current.
-    reopened = PersonStore(root)
-    assert reopened.descriptions(person["person_id"])["general"]["version"] == 0
-    assert _user_version(db) == migrations.spec_for("people_db").current_version
-
-
 def test_legacy_meeting_evidence_db_upgrades_from_the_pre_registry_shape(tmp_path):
     root = build_legacy_state(tmp_path / "state")
     db = root / "meeting_evidence.db"
@@ -537,7 +330,6 @@ def test_legacy_jsonl_and_opaque_stores_adopt_a_version_in_the_manifest(tmp_path
 
 
 def test_state_is_readable_by_the_real_stores_after_a_restart(tmp_path):
-    from coworker.people import PersonStore
     from coworker.store import ConversationStore
     from coworker.workspace import WorkspaceGrantStore
 
@@ -548,337 +340,10 @@ def test_state_is_readable_by_the_real_stores_after_a_restart(tmp_path):
     assert store.load("main")[0]["content"] == "find leads at Rippling"
     assert len(store.list_schedule()["jobs"]) == 1
     assert store.get_setting("persona") == "sourcing"
-    people = PersonStore(root)
-    assert people.get(LEGACY_PERSON_ID)["first_name"] == "Dana"
-    assert people.person_for_session("main") == LEGACY_PERSON_ID
     assert len(WorkspaceGrantStore(root).list_all()) == 1
 
     # Constructing the stores must not knock the recorded version off current.
     assert _user_version(root / "club.db") == 2
-    assert _user_version(root / "people.db") == PEOPLE_DB_VERSION
-
-
-def _people_v2_with_handoff_and_restricted_source(root: Path) -> str:
-    """A populated version 2 people.db, from before descriptions and tasks."""
-    from coworker.people import PersonStore
-
-    people = PersonStore(root)
-    person = people.keep_from_apollo(
-        apollo_id="apollo-nora",
-        first_name="Nora",
-        last_name_obfuscated="Kim",
-        title="Recruiting lead",
-        company="Northwind",
-        target="Northwind",
-    )
-    person_id = str(person["person_id"])
-    people.set_sequence(person_id, "in_conversation", actor="director")
-    people.set_handoff(
-        person_id,
-        who="Nora Kim, recruiting lead at Northwind",
-        wanted="An intro to their university team",
-        happened="Replied asking for a proposal",
-        they_want="A proposal by Friday",
-    )
-    people.upsert_attachment(
-        person_id,
-        record_type="source_ref",
-        fields={"provider": "Google Drive", "title": "Private notes", "sensitivity": "restricted"},
-        idempotency_key="private-notes",
-        actor="director",
-        rationale_summary="Private source",
-    )
-    people._conn.close()
-    conn = sqlite3.connect(root / "people.db")
-    try:
-        for name in ("crm_proposals", "crm_analysis_attempts", "crm_analysis_state",
-                     "crm_operations", "crm_changes", "person_tasks", "person_descriptions"):
-            conn.execute(f"DROP TABLE {name}")
-        conn.execute("PRAGMA user_version = 2")
-        conn.commit()
-    finally:
-        conn.close()
-    return person_id
-
-
-_PEOPLE_V2_TABLES = (
-    "people",
-    "events",
-    "session_people",
-    "person_attachments",
-    "person_versions",
-    "reply_sync",
-)
-
-
-def test_people_v3_adds_tasks_and_leaves_existing_people_intact(tmp_path):
-    from coworker.crm_tasks import TaskService
-    from coworker.people import PersonStore
-
-    root = tmp_path / "state"
-    person_id = _people_v2_with_handoff_and_restricted_source(root)
-    before = _dump_database(root / "people.db")
-
-    plan = _plan_for(migrations.plan_migrations(root), "people_db")
-    assert plan.status is StoreStatus.PENDING
-    assert [(step.from_version, step.to_version) for step in plan.steps] == [(2, 3), (3, 4), (REBUILD_FROM, REBUILD_FROM + 1), (5, 6), (6, 7), (7, 8), (8, 9), (9, 10)]
-
-    outcome = migrations.apply_migrations(root)
-    assert outcome.error is None
-    assert outcome.backup_id is not None
-    assert _user_version(root / "people.db") == PEOPLE_DB_VERSION
-
-    after = _dump_database(root / "people.db")
-    assert after["integrity"] == ["ok"]
-    for table in _PEOPLE_V2_TABLES:
-        assert after["rows"][table] == before["rows"][table], table
-    # No task, change or receipt is invented for an existing person.
-    for table in ("person_tasks", "crm_changes", "crm_operations"):
-        assert after["rows"][table] == []
-
-    people = PersonStore(root)
-    person = people.get(person_id, expand_sources=True)
-    assert person["sequence_state"] == "in_conversation"
-    assert person["handoff_they_want"] == "A proposal by Friday"
-    assert person["restricted_source_count"] == 1
-    assert person["sources"] == []
-    task = TaskService(people).create(
-        person_id,
-        title="Send the proposal",
-        due_date="2026-10-16",
-        timezone="America/Los_Angeles",
-        operation_id="op-after-upgrade",
-        actor="director",
-    )["task"]
-    assert task["person_id"] == person_id
-    # Opening the store again must not knock the recorded version off current.
-    assert _user_version(root / "people.db") == PEOPLE_DB_VERSION
-
-
-def test_a_failed_people_tasks_step_restores_the_v2_database(tmp_path, monkeypatch):
-    root = tmp_path / "state"
-    _people_v2_with_handoff_and_restricted_source(root)
-    before = _dump_database(root / "people.db")
-
-    def explode(context):
-        # Partially apply, then fail: the rollback has to undo real DDL.
-        context.connection.execute("CREATE TABLE person_tasks (task_id TEXT)")
-        raise RuntimeError("task step failed")
-
-    original = migrations.spec_for("people_db")
-    broken = migrations.dataclasses.replace(
-        original,
-        migrations=(
-            *original.migrations[:3],
-            dataclasses.replace(original.migrations[3], apply=explode),
-            *original.migrations[4:],
-        ),
-    )
-    monkeypatch.setattr(
-        migrations,
-        "REGISTRY",
-        tuple(
-            broken if item.store_id == "people_db" else item
-            for item in migrations.REGISTRY
-        ),
-    )
-
-    outcome = migrations.apply_migrations(root)
-    assert outcome.error is not None
-    assert "people_db" in outcome.rolled_back
-    assert outcome.backup_id is not None
-    assert _dump_database(root / "people.db") == before
-    assert _user_version(root / "people.db") == 2
-
-    monkeypatch.undo()
-    assert migrations.apply_migrations(root).error is None
-    assert _user_version(root / "people.db") == PEOPLE_DB_VERSION
-
-
-def test_a_fresh_people_db_reaches_the_current_version_with_empty_task_tables(tmp_path):
-    from coworker.people import PersonStore
-
-    root = tmp_path / "state"
-    PersonStore(root)._conn.close()
-    assert migrations.apply_migrations(root).error is None
-    assert _user_version(root / "people.db") == PEOPLE_DB_VERSION
-    dump = _dump_database(root / "people.db")
-    assert dump["rows"]["person_tasks"] == []
-    assert dump["rows"]["people"] == []
-
-
-_CRM_CHANGES_V3_DDL = """
-CREATE TABLE crm_changes (
-    change_id TEXT PRIMARY KEY,
-    person_id TEXT NOT NULL REFERENCES people(person_id),
-    entity_type TEXT NOT NULL CHECK (entity_type IN ('task')),
-    entity_id TEXT NOT NULL,
-    entity_version INTEGER NOT NULL CHECK (entity_version >= 1),
-    action TEXT NOT NULL CHECK (action IN ('create', 'update')),
-    before_json TEXT,
-    after_json TEXT NOT NULL,
-    actor TEXT NOT NULL CHECK (actor IN ('director', 'assistant')),
-    reason TEXT NOT NULL,
-    source_refs TEXT NOT NULL DEFAULT '[]',
-    operation_id TEXT NOT NULL,
-    session_id TEXT,
-    run_id TEXT,
-    compensates_change_id TEXT REFERENCES crm_changes(change_id),
-    created_at TEXT NOT NULL
-)
-"""
-
-
-def _people_before_crm_rebuild(root: Path) -> tuple[str, str]:
-    """A people.db one version before the crm_changes rebuild: one task, its
-    create change and its operation receipt, in the pre-rebuild table."""
-    from coworker.crm_tasks import TaskService
-    from coworker.people import PersonStore
-
-    people = PersonStore(root)
-    person_id = people.keep_from_apollo(
-        apollo_id="nora", first_name="Nora", last_name_obfuscated="K.", title="Lead", company="Northwind"
-    )["person_id"]
-    task = TaskService(people).create(
-        person_id,
-        title="Send the proposal",
-        due_date="2026-10-16",
-        timezone="America/Los_Angeles",
-        operation_id="op-before-v4",
-        actor="director",
-    )["task"]
-    people._conn.close()
-    conn = sqlite3.connect(root / "people.db")
-    try:
-        changes = conn.execute("SELECT * FROM crm_changes").fetchall()
-        operations = conn.execute("SELECT * FROM crm_operations").fetchall()
-        ops_ddl = conn.execute(
-            "SELECT sql FROM sqlite_master WHERE name = 'crm_operations'"
-        ).fetchone()[0]
-        for name in ("crm_proposals", "crm_analysis_attempts", "crm_analysis_state"):
-            conn.execute(f"DROP TABLE {name}")
-        conn.execute("DROP TABLE crm_operations")
-        conn.execute("DROP TABLE crm_changes")
-        conn.execute(_CRM_CHANGES_V3_DDL)
-        conn.execute(
-            "CREATE INDEX crm_changes_entity ON crm_changes(entity_type, entity_id, created_at)"
-        )
-        conn.execute(ops_ddl)
-        conn.executemany(
-            f"INSERT INTO crm_changes VALUES ({', '.join('?' * len(changes[0]))})", changes
-        )
-        conn.executemany(
-            f"INSERT INTO crm_operations VALUES ({', '.join('?' * len(operations[0]))})",
-            operations,
-        )
-        conn.execute(f"PRAGMA user_version = {REBUILD_FROM}")
-        conn.commit()
-    finally:
-        conn.close()
-    return person_id, task["task_id"]
-
-
-def test_the_crm_changes_rebuild_keeps_every_row(tmp_path):
-    from coworker.crm_tasks import TaskService
-    from coworker.people import PersonStore
-
-    root = tmp_path / "state"
-    person_id, task_id = _people_before_crm_rebuild(root)
-    before = _dump_database(root / "people.db")
-    conn = sqlite3.connect(root / "people.db")
-    with pytest.raises(sqlite3.IntegrityError):
-        conn.execute(
-            "UPDATE crm_changes SET action = 'complete' WHERE entity_id = ?", (task_id,)
-        )
-    conn.close()
-
-    plan = _plan_for(migrations.plan_migrations(root), "people_db")
-    assert plan.status is StoreStatus.PENDING
-    assert [(step.from_version, step.to_version) for step in plan.steps] == [
-        (REBUILD_FROM, REBUILD_FROM + 1), (5, 6), (6, 7), (7, 8), (8, 9), (9, 10)
-    ]
-    outcome = migrations.apply_migrations(root)
-    assert outcome.error is None
-    assert next(step for step in outcome.applied if step.to_version == 6).record_count == 1
-    assert _user_version(root / "people.db") == PEOPLE_DB_VERSION
-
-    after = _dump_database(root / "people.db")
-    assert after["integrity"] == ["ok"]
-    for table in (*_PEOPLE_V2_TABLES, "person_tasks", "crm_changes", "crm_operations"):
-        assert after["rows"][table] == before["rows"][table], table
-    conn = sqlite3.connect(root / "people.db")
-    conn.execute("PRAGMA foreign_keys = ON")
-    assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
-    assert [row[2] for row in conn.execute("PRAGMA foreign_key_list(crm_operations)")] == [
-        "crm_changes"
-    ]
-    assert conn.execute(
-        "SELECT name FROM sqlite_master WHERE name = 'crm_changes_entity'"
-    ).fetchone() is not None
-    conn.close()
-
-    # The widened table takes the new actions, and the old receipt still replays.
-    people = PersonStore(root)
-    service = TaskService(people)
-    done = service.update(
-        person_id,
-        task_id,
-        changes={"state": "completed"},
-        expected_version=1,
-        timezone="America/Los_Angeles",
-        operation_id="op-after-v4",
-        actor="director",
-    )
-    assert done["change"]["action"] == "complete"
-    replay = service.create(
-        person_id,
-        title="Send the proposal",
-        due_date="2026-10-16",
-        timezone="America/Los_Angeles",
-        operation_id="op-before-v4",
-        actor="director",
-    )
-    assert replay["replayed"] is True and replay["task"]["task_id"] == task_id
-    assert _user_version(root / "people.db") == PEOPLE_DB_VERSION
-
-
-def test_a_failed_crm_changes_rebuild_restores_the_previous_database(tmp_path, monkeypatch):
-    root = tmp_path / "state"
-    _people_before_crm_rebuild(root)
-    before = _dump_database(root / "people.db")
-
-    def explode(context):
-        # Fail after the rebuild has dropped the old table.
-        context.connection.execute("CREATE TABLE crm_changes_new (change_id TEXT)")
-        context.connection.execute("DROP TABLE crm_changes")
-        raise RuntimeError("rebuild failed")
-
-    original = migrations.spec_for("people_db")
-    broken = migrations.dataclasses.replace(
-        original,
-        migrations=tuple(
-            dataclasses.replace(step, apply=explode) if step.from_version == REBUILD_FROM else step
-            for step in original.migrations
-        ),
-    )
-    monkeypatch.setattr(
-        migrations,
-        "REGISTRY",
-        tuple(broken if item.store_id == "people_db" else item for item in migrations.REGISTRY),
-    )
-
-    outcome = migrations.apply_migrations(root)
-    assert outcome.error is not None
-    assert "people_db" in outcome.rolled_back
-    assert _dump_database(root / "people.db") == before
-    assert _user_version(root / "people.db") == REBUILD_FROM
-
-    monkeypatch.undo()
-    assert migrations.apply_migrations(root).error is None
-    assert _user_version(root / "people.db") == PEOPLE_DB_VERSION
-
-
-# --- failing closed ------------------------------------------------------
 
 
 def test_unknown_future_sqlite_version_fails_closed_without_modifying_state(tmp_path):
@@ -961,7 +426,7 @@ def test_migration_takes_a_timestamped_backup_before_changing_state(tmp_path):
     manifest = json.loads((backup_dir / "manifest.json").read_text(encoding="utf-8"))
     assert manifest["reason"] == "migration"
     backed_up = {entry["store_id"] for entry in manifest["entries"]}
-    assert {"conversation_db", "people_db", "workspace_grants"} <= backed_up
+    assert {"conversation_db", "workspace_grants"} <= backed_up
     assert _user_version(backup_dir / "club.db") == 0
 
 
@@ -1142,7 +607,7 @@ def test_a_partially_applied_migration_does_not_leave_other_stores_half_done(
     def explode(_context):
         raise RuntimeError("migration step failed")
 
-    original = migrations.spec_for("people_db")
+    original = migrations.spec_for("conversation_db")
     broken = migrations.dataclasses.replace(
         original,
             migrations=(
@@ -1160,16 +625,16 @@ def test_a_partially_applied_migration_does_not_leave_other_stores_half_done(
         migrations,
         "REGISTRY",
         tuple(
-            broken if item.store_id == "people_db" else item
+            broken if item.store_id == "conversation_db" else item
             for item in migrations.REGISTRY
         ),
     )
 
     outcome = migrations.apply_migrations(root)
     assert outcome.error is not None
-    assert _user_version(root / "people.db") == 0
+    assert _user_version(root / "club.db") == 0
     # Stores that already migrated stay migrated; only the failing one rolls back.
-    assert "people_db" in outcome.rolled_back
+    assert "conversation_db" in outcome.rolled_back
     assert migrations.plan_migrations(root).blocked is False
 
 

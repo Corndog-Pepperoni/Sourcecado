@@ -2,6 +2,7 @@
 import asyncio
 import json
 
+import psycopg
 import pytest
 from fastapi.testclient import TestClient
 
@@ -12,15 +13,16 @@ from test_crm_analysis import DescriptionModel, ReadOnlyMail, tracked_person, wo
 
 
 def source_for(people, pid, mid):
-    with people._lock:
+    with people.transaction():
         return next(people._attachment_dict(row) for row in people._conn.execute(
-            "SELECT * FROM person_attachments WHERE person_id=? AND record_type='source_ref'", (pid,))
+            "SELECT * FROM person_attachments WHERE user_id = %s AND person_id=%s AND record_type='source_ref'",
+            (people._user_id, pid))
             if json.loads(row["fields_json"]).get("message_id") == mid)
 
 
 def restrict(people, source_id):
-    with people._lock, people._conn:
-        people._conn.execute("UPDATE person_attachments SET restricted=1 WHERE id=?", (source_id,))
+    with people.transaction():
+        people._conn.execute("UPDATE person_attachments SET restricted=1 WHERE user_id = %s AND id=%s", (people._user_id, source_id))
 
 
 @pytest.mark.parametrize("during_message", ["reply-1", "sent-1"])
@@ -92,8 +94,8 @@ def test_source_identity_changed_during_later_read_does_not_enter_prompt(tmp_pat
             if message_id == "sent-1":
                 ref = source_for(people, pid, "reply-1")
                 fields = {**ref["fields"], "message_id": "other-message"}
-                with people._lock, people._conn:
-                    people._conn.execute("UPDATE person_attachments SET fields_json=? WHERE id=?", (json.dumps(fields), ref["id"]))
+                with people.transaction():
+                    people._conn.execute("UPDATE person_attachments SET fields_json=%s WHERE user_id = %s AND id=%s", (json.dumps(fields), people._user_id, ref["id"]))
             return result
     model = DescriptionModel()
     result = asyncio.run(worker(people, model, ChangedSource()).analyze(pid))
@@ -117,7 +119,7 @@ def test_authenticated_resolution_replays_after_response_loss_restart_and_change
     assert first.status_code == 200
     saved = first.json()
     versions = app.state.people.descriptions(pid)
-    changes = app.state.people._conn.execute("SELECT count(*) FROM crm_changes").fetchone()[0]
+    changes = app.state.people._conn.execute("SELECT count(*) FROM crm_changes WHERE user_id = %s", (app.state.people._user_id,)).fetchone()[0]
     restarted = create_app(token="proposal-replay", state=tmp_path, provider=DescriptionModel(), gmail=ReadOnlyMail())
     with TestClient(restarted) as client:
         replay = client.post(url, headers=headers, json=body)
@@ -126,7 +128,7 @@ def test_authenticated_resolution_replays_after_response_loss_restart_and_change
         assert client.post(url, headers=headers, json={**body, "action": "dismiss" if action == "accept" else "accept"}).status_code == 409
         assert client.post(url, headers=headers, json={**body, "expected_version": proposal["version"]+1}).status_code == 409
     assert restarted.state.people.descriptions(pid) == versions
-    assert restarted.state.people._conn.execute("SELECT count(*) FROM crm_changes").fetchone()[0] == changes
+    assert restarted.state.people._conn.execute("SELECT count(*) FROM crm_changes WHERE user_id = %s", (restarted.state.people._user_id,)).fetchone()[0] == changes
     if action == "accept":
         DescriptionService(restarted.state.people).undo(pid, saved["change_id"], operation_id="undo-after-accept")
         undone = restarted.state.people.descriptions(pid)
@@ -196,7 +198,6 @@ def test_genuine_attribution_change_creates_a_new_pending_input_revision(tmp_pat
 
 
 def test_resolution_receipt_and_target_write_roll_back_together(tmp_path):
-    import sqlite3
     people = PersonStore(tmp_path)
     pid = tracked_person(people)
     people.patch_description(pid, "general", expected_version=0, text="Keep", actor="director", rationale_summary="Keep this overview.")
@@ -204,34 +205,24 @@ def test_resolution_receipt_and_target_write_roll_back_together(tmp_path):
     asyncio.run(service.analyze(pid))
     proposal = service.proposals(pid)[0]
     before = people.descriptions(pid)
-    history_count = people._conn.execute("SELECT count(*) FROM crm_changes").fetchone()[0]
+    count_sql = "SELECT count(*) FROM crm_changes WHERE user_id = %s"
+    history_count = people._conn.execute(count_sql, (people._user_id,)).fetchone()[0]
+    # The trigger rejects the receipt write of this user only, then goes away.
+    people._conn.execute("""CREATE FUNCTION reject_resolution_fn() RETURNS trigger LANGUAGE plpgsql AS $$
+        BEGIN IF NEW.user_id = '%s' THEN RAISE EXCEPTION 'simulated receipt storage failure'; END IF; RETURN NEW; END $$"""
+        % people._user_id)
     people._conn.execute("""CREATE TRIGGER reject_resolution BEFORE UPDATE OF resolution_receipt_json ON crm_proposals
-        BEGIN SELECT RAISE(ABORT, 'simulated receipt storage failure'); END""")
-    with pytest.raises(sqlite3.IntegrityError):
-        service.resolve(pid, proposal["proposal_id"], action="accept", expected_version=1)
+        FOR EACH ROW EXECUTE FUNCTION reject_resolution_fn() -- user_id""")
+    try:
+        with pytest.raises(psycopg.Error):
+            service.resolve(pid, proposal["proposal_id"], action="accept", expected_version=1)
+    finally:
+        people._conn.execute("DROP TRIGGER reject_resolution ON crm_proposals -- user_id")
+        people._conn.execute("DROP FUNCTION reject_resolution_fn() -- user_id")
     assert people.descriptions(pid) == before
-    assert people._conn.execute("SELECT count(*) FROM crm_changes").fetchone()[0] == history_count
-    row = people._conn.execute("SELECT state, resolution_receipt_json FROM crm_proposals WHERE proposal_id=?", (proposal["proposal_id"],)).fetchone()
+    assert people._conn.execute(count_sql, (people._user_id,)).fetchone()[0] == history_count
+    row = people._conn.execute("SELECT state, resolution_receipt_json FROM crm_proposals WHERE user_id = %s AND proposal_id=%s", (people._user_id, proposal["proposal_id"])).fetchone()
     assert row["state"] == "pending" and row["resolution_receipt_json"] is None
-
-
-def test_resolution_receipt_json_is_registered_and_doctor_validates_it(tmp_path):
-    from coworker import doctor, migrations
-    people = PersonStore(tmp_path)
-    pid = tracked_person(people)
-    people.patch_description(pid, "general", expected_version=0, text="Keep", actor="director", rationale_summary="Keep this overview.")
-    service = worker(people)
-    asyncio.run(service.analyze(pid))
-    proposal = service.proposals(pid)[0]
-    original = service.resolve(pid, proposal["proposal_id"], action="dismiss", expected_version=1)
-    assert ("crm_proposals", "resolution_receipt_json") in migrations.spec_for("people_db").json_columns
-    receipt = people._conn.execute("SELECT resolution_receipt_json FROM crm_proposals WHERE proposal_id=?", (proposal["proposal_id"],)).fetchone()[0]
-    assert json.loads(receipt)["response"] == original
-    with people._conn:
-        people._conn.execute("UPDATE crm_proposals SET resolution_receipt_json='broken json' WHERE proposal_id=?", (proposal["proposal_id"],))
-    report = doctor.diagnose(tmp_path)
-    assert any(f.check == "sqlite.corrupt_row" and f.store_id == "people_db"
-        and any("crm_proposals.resolution_receipt_json" in detail for detail in f.detail) for f in report.findings)
 
 
 def test_pointer_normalization_preserves_unrelated_source_metadata_shapes(tmp_path):

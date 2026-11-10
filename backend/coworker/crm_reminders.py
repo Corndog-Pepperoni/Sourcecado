@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-import sqlite3
+import psycopg
 from collections.abc import Callable
 from typing import Any
 
@@ -23,8 +23,8 @@ class ReminderService:
     def _confirmed(self, person_id: str, message_id: str) -> dict[str, Any]:
         self.tasks._live_person(person_id)
         event = self.people._conn.execute(
-            "SELECT payload FROM events WHERE person_id=? AND external_key=? AND source='gmail' AND kind='send'",
-            (person_id, f"gmail:message:{message_id}"),
+            "SELECT payload FROM events WHERE user_id = %s AND person_id=%s AND external_key=%s AND source='gmail' AND kind='send'",
+            (self.people._user_id, person_id, f"gmail:message:{message_id}"),
         ).fetchone()
         payload = json.loads(event["payload"]) if event else {}
         approval = self.store.get_inbox(str(payload.get("approval_id") or "")) or {}
@@ -49,12 +49,12 @@ class ReminderService:
         return f"sent-reminder:{digest}"
 
     def context(self, person_id: str, message_id: str) -> dict[str, Any]:
-        with self.people._lock:
+        with self.people.transaction():
             self._confirmed(person_id, message_id)
             person = self.people.get(person_id)
             operation = self._operation(person_id, message_id)
             saved = self.people._conn.execute(
-                "SELECT entity_id FROM crm_operations WHERE operation_id=? AND entity_type='task'", (operation,),
+                "SELECT entity_id FROM crm_operations WHERE user_id = %s AND operation_id=%s AND entity_type='task'", (self.people._user_id, operation),
             ).fetchone()
             task = self.tasks.get(person_id, saved["entity_id"]) if saved else None
         name = " ".join(str(person.get(key) or "") for key in ("first_name", "last_name")).strip()
@@ -80,9 +80,9 @@ class ReminderService:
                       "thread_id": sent.get("thread_id"), "approval_id": sent["approval_id"]}
             now = self.people._now()
             conn.execute("""INSERT INTO person_attachments
-                (id,person_id,record_type,idempotency_key,fields_json,restricted,created_at,updated_at)
-                VALUES (?,?,'source_ref',?,?,0,?,?) ON CONFLICT DO NOTHING""",
-                (source_id, person_id, operation, json.dumps(fields, sort_keys=True), now, now))
+                (user_id,id,person_id,record_type,idempotency_key,fields_json,restricted,created_at,updated_at)
+                VALUES (%s,%s,%s,'source_ref',%s,%s,0,%s,%s) ON CONFLICT DO NOTHING""",
+                (self.people._user_id, source_id, person_id, operation, json.dumps(fields, sort_keys=True), now, now))
             # Same transactional writer as every other ordinary task; source and
             # task/history/operation either all commit or all roll back.
             response = self.tasks._create_uncommitted(
@@ -118,7 +118,7 @@ def reminder_router(*, people: PersonStore, tasks: TaskService, store: Conversat
             return JSONResponse(result, status_code=200 if result["replayed"] else 201)
         except TaskError as exc:
             return failure(exc)
-        except (sqlite3.Error, RuntimeError):
+        except (psycopg.Error, RuntimeError):
             return JSONResponse({"error": "Couldn’t save the follow-up. Your email was already sent; retry only this task."}, status_code=503)
 
     return router

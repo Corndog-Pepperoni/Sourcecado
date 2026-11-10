@@ -49,7 +49,7 @@ def _installed(**overrides) -> m.BuildIdentity:
         "version": "0.0.1",
         "platform": "macos",
         "arch": "aarch64",
-        "state_versions": {"people_db": 1, "conversation_db": 3},
+        "state_versions": {"conversation_db": 1, "conversation_db": 3},
     }
     fields.update(overrides)
     return m.BuildIdentity(**fields)
@@ -66,7 +66,7 @@ def _signed(artifact_path, **overrides) -> dict:
         "artifact_size": artifact_path.stat().st_size,
         "artifact_sha256": m.sha256_file(artifact_path),
         "minimum_upgradable_version": "0.0.1",
-        "state_versions": {"people_db": 1, "conversation_db": 3},
+        "state_versions": {"conversation_db": 1, "conversation_db": 3},
         "released_at": "2026-08-27T12:00:00+00:00",
         "commit": "0" * 40,
     }
@@ -300,7 +300,7 @@ def test_a_manifest_expecting_a_state_version_this_build_cannot_reach_refuses(
 ):
     seed, public = _keypair()
     artifact = _artifact(tmp_path)
-    document = _document(artifact, seed, state_versions={"people_db": 9})
+    document = _document(artifact, seed, state_versions={"conversation_db": 9})
     outcome = _verify(document, artifact, public)
     assert not outcome.ok
     assert outcome.refusal is m.Refusal.STATE_AHEAD_OF_MIGRATOR
@@ -369,7 +369,7 @@ def test_registry_state_versions_reads_the_migration_registry():
     assert versions == {
         spec.store_id: spec.current_version for spec in migrations.REGISTRY
     }
-    assert versions["people_db"] >= 1
+    assert versions["conversation_db"] >= 1
 
 
 # --- canonical bytes -----------------------------------------------------

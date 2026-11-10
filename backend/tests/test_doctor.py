@@ -142,7 +142,7 @@ def test_an_old_schema_version_is_reported_with_its_proposed_upgrade(tmp_path):
     finding = _finding(report, "store.version_behind")
     assert finding.repair is Repair.AUTOMATIC
     upgrades = [item for item in report.proposed_repairs if item.action == "migration.apply"]
-    assert {item.store_id for item in upgrades} >= {"conversation_db", "people_db"}
+    assert {item.store_id for item in upgrades} >= {"conversation_db"}
     assert any(item.record_count > 0 for item in upgrades)
 
 
@@ -197,41 +197,6 @@ def test_a_corrupt_json_column_is_detected_and_is_review_required(tmp_path):
     assert finding.repair is Repair.REVIEW_REQUIRED
     assert finding.record_count == 1
     assert any("inbox.arguments" in line for line in finding.detail)
-
-
-def test_a_corrupt_person_event_payload_is_detected(tmp_path):
-    root = build_current_state(tmp_path / "state")
-    migrations.apply_migrations(root)
-    conn = _connect(root, "people.db")
-    conn.execute("UPDATE events SET payload = '{broken'")
-    conn.commit()
-    conn.close()
-
-    finding = _finding(doctor.diagnose(root), "sqlite.corrupt_row")
-    assert finding.store_id == "people_db"
-    assert finding.repair is Repair.REVIEW_REQUIRED
-
-
-def test_a_malformed_database_is_reported_and_never_repaired(tmp_path):
-    root = build_current_state(tmp_path / "state")
-    migrations.apply_migrations(root)
-    path = root / "people.db"
-    raw = bytearray(path.read_bytes())
-    raw[4096 : 4096 + 512] = b"\x00" * 512
-    path.write_bytes(bytes(raw))
-    before = _tree_digest(root)
-
-    report = doctor.diagnose(root)
-    assert {"sqlite.integrity", "store.unreadable"} & _checks(report)
-    assert all(
-        item.repair is not Repair.AUTOMATIC
-        for item in report.findings
-        if item.store_id == "people_db"
-    )
-    assert report.blocked is True
-
-    doctor.repair(root)
-    assert _outside_backups(_tree_digest(root)) == _outside_backups(before)
 
 
 def test_a_corrupt_drive_ingestion_db_is_reported_and_never_repaired(tmp_path):
@@ -492,27 +457,15 @@ def test_orphaned_queue_and_approval_links_are_detected(tmp_path):
     )
     conn.commit()
     conn.close()
-    people = _connect(root, "people.db")
-    people.execute(
-        "INSERT INTO session_people (session_id, person_id) VALUES ('ghost', 'per_x')"
-    )
-    people.execute(
-        "INSERT INTO events (event_id, person_id, source, kind, summary, actor) "
-        "VALUES ('evt_orphan', 'per_missing', 'gmail', 'mail', 'stranded', 'assistant')"
-    )
-    people.commit()
-    people.close()
 
     report = doctor.diagnose(root)
     assert _finding(report, "queue.orphaned_session").record_count == 1
     assert _finding(report, "approval.orphaned_session").record_count == 1
     assert _finding(report, "approval.orphaned_chain").record_count == 1
-    assert _finding(report, "person.orphaned_session_binding").record_count == 1
-    assert _finding(report, "person.orphaned_event").record_count == 1
     assert all(
         item.repair is Repair.REVIEW_REQUIRED
         for item in report.findings
-        if item.check.startswith(("queue.", "approval.", "person."))
+        if item.check.startswith(("queue.", "approval."))
     )
 
 
@@ -625,10 +578,8 @@ def test_repair_is_idempotent(tmp_path):
 
 
 def test_state_is_usable_after_repair_and_a_restart(tmp_path):
-    from coworker.people import PersonStore
     from coworker.store import ConversationStore
     from coworker.workspace import WorkspaceGrantStore
-    from tests.state_fixtures import LEGACY_PERSON_ID
 
     root = build_legacy_state(tmp_path / "state")
     os.chmod(root / "club.db", 0o644)
@@ -640,7 +591,6 @@ def test_state_is_usable_after_repair_and_a_restart(tmp_path):
     store = ConversationStore(root)
     assert len(store.load("main")) == 2
     assert store.list_schedule()["jobs"][0]["template_id"] == "legacy"
-    assert PersonStore(root).get(LEGACY_PERSON_ID)["first_name"] == "Dana"
     assert len(WorkspaceGrantStore(root).list_all()) == 1
     assert doctor.diagnose(root).healthy is True
 
@@ -694,7 +644,6 @@ _DRIFT_ONLY_CARRIERS = (
 # Stores that produce a finding naming themselves.
 _SELF_REPORTING_CARRIERS = {
     "conversation_db": "sqlite.corrupt_row",
-    "people_db": "sqlite.corrupt_row",
     "conversation_transcripts": "jsonl.torn_tail",
     "presentation_events": "jsonl.record_version",
     "workspace_receipts": "jsonl.torn_tail",
@@ -721,17 +670,6 @@ def _provoke_findings_in_every_store(root: Path, *, include_blocking: bool = Tru
     )
     conn.commit()
     conn.close()
-    people = _connect(root, "people.db")
-    # Add a corrupt row rather than overwriting the planted one, so people.db
-    # still carries a credential for the leak assertions to be about.
-    people.execute(
-        "INSERT INTO events "
-        "(event_id, person_id, source, kind, summary, payload, actor) "
-        "SELECT 'evt_corrupt', person_id, 'gmail', 'mail', 'corrupt payload', "
-        "'{broken', 'assistant' FROM people LIMIT 1"
-    )
-    people.commit()
-    people.close()
     # JSONL directory and JSONL log: a crash-torn tail holding a credential.
     with (root / "conversations" / "main.jsonl").open("a", encoding="utf-8") as handle:
         handle.write(json.dumps({"role": "user", "content": PLANTED_API_KEY})[:40])
@@ -762,7 +700,7 @@ def test_every_store_kind_holds_a_planted_secret(tmp_path):
     root = build_current_state(tmp_path / "state", plant_secrets=True)
 
     carriers = {
-        migrations.StoreKind.SQLITE: ["club.db", "people.db"],
+        migrations.StoreKind.SQLITE: ["club.db"],
         migrations.StoreKind.JSONL_DIR: ["conversations/main.jsonl", "events/main.jsonl"],
         migrations.StoreKind.JSONL_LOG: ["workspace_receipts.jsonl"],
         migrations.StoreKind.JSON_DOCUMENT: [
@@ -1451,7 +1389,6 @@ def test_orphaned_run_links_are_detected(tmp_path):
         kind="waiting_approval",
         state="waiting_approval",
         approval_ids=["call_that_never_existed"],
-        person_id="per_missing_from_the_person_store",
     )
     repo.close()
     conn = _connect(root, "agent_runs.db")
@@ -1469,7 +1406,6 @@ def test_orphaned_run_links_are_detected(tmp_path):
     assert _finding(report, "agent_run.orphaned_approval").record_count == 1
     assert _finding(report, "agent_run.orphaned_parent").record_count == 1
     assert _finding(report, "agent_run.orphaned_session").record_count == 1
-    assert _finding(report, "agent_run.orphaned_person").record_count == 1
     assert _finding(report, "agent_run.orphaned_checkpoint").record_count == 1
     assert all(
         item.repair is Repair.REVIEW_REQUIRED
@@ -1482,16 +1418,12 @@ def test_orphaned_run_links_are_detected(tmp_path):
 def test_links_that_resolve_are_not_reported_as_orphans(tmp_path):
     root = build_current_state(tmp_path / "state")
     migrations.apply_migrations(root)
-    people = _connect(root, "people.db")
-    person_id = str(people.execute("SELECT person_id FROM people LIMIT 1").fetchone()[0])
-    people.close()
     repo, owner, started = _seed_run(root, session_id="main")
     repo.checkpoint(
         started.lease,
         kind="waiting_approval",
         state="waiting_approval",
         approval_ids=["call_gmail_send_1"],
-        person_id=person_id,
     )
     repo.close()
 
@@ -1541,12 +1473,11 @@ def test_no_planted_secret_survives_the_agent_run_checks(tmp_path):
     repo.close()
     conn = _connect(root, "agent_runs.db")
     conn.execute(
-        "UPDATE agent_runs SET session_id = ?, lease_owner = ?, person_id = ?, "
+        "UPDATE agent_runs SET session_id = ?, lease_owner = ?, "
         "parent_run_id = ?, approval_ids = ? WHERE run_id = ?",
         (
             f"session-{PLANTED_API_KEY}",
             f"owner-{PLANTED_BEARER}",
-            f"per_{PLANTED_API_KEY}",
             f"run-{PLANTED_BEARER}",
             json.dumps([f"call_{PLANTED_API_KEY}"]),
             run_id,
@@ -1569,7 +1500,6 @@ def test_no_planted_secret_survives_the_agent_run_checks(tmp_path):
         "agent_run.orphaned_approval",
         "agent_run.orphaned_parent",
         "agent_run.orphaned_session",
-        "agent_run.orphaned_person",
         "agent_run.unknown_owner",
     ):
         finding = _finding(report, check)

@@ -139,7 +139,7 @@ def test_descriptions_stay_out_of_handoff_and_activity(tmp_path):
     _save(store, person["person_id"], "general", "Secret summary.",
           expected_version=0)
     row = store._conn.execute(
-        "SELECT * FROM people WHERE person_id = ?", (person["person_id"],)
+        "SELECT * FROM people WHERE user_id = %s AND person_id = %s", (store._user_id, person["person_id"])
     ).fetchone()
     for field in (
         "handoff_who", "handoff_wanted", "handoff_happened", "handoff_they_want"
@@ -182,9 +182,9 @@ def test_snapshot_captures_descriptions(tmp_path):
     latest = store._conn.execute(
         """
         SELECT person_json FROM person_versions
-        WHERE person_id = ? ORDER BY version DESC LIMIT 1
+        WHERE user_id = %s AND person_id = %s ORDER BY version DESC LIMIT 1
         """,
-        (person["person_id"],),
+        (store._user_id, person["person_id"]),
     ).fetchone()
     captured = json.loads(latest["person_json"])["descriptions"]
     assert captured["general"]["text"] == "Snapshot me."

@@ -272,7 +272,7 @@ def test_a_pending_migration_is_backed_up_and_applied_by_the_registry(tmp_path):
     pending_before = {
         item.store_id for item in migrations.plan_migrations(install.state_root).pending
     }
-    assert "people_db" in pending_before
+    assert "conversation_db" in pending_before
 
     outcome = _apply(fx.document(artifact, seed), install, artifact, public)
 
@@ -321,7 +321,7 @@ def test_the_backup_is_created_before_anything_changes(tmp_path):
 def test_a_store_from_a_future_version_refuses_the_whole_update(tmp_path):
     """The registry's own fail-closed rule, not a second opinion about it."""
     seed, public, artifact, install = _prepare(tmp_path, state=build_legacy_state)
-    conn = sqlite3.connect(install.state_root / "people.db")
+    conn = sqlite3.connect(install.state_root / "club.db")
     conn.execute("PRAGMA user_version = 99")
     conn.commit()
     conn.close()
@@ -331,7 +331,7 @@ def test_a_store_from_a_future_version_refuses_the_whole_update(tmp_path):
 
     assert outcome.stage is UpdateStage.COMPATIBILITY
     assert outcome.status is UpdateStatus.REFUSED
-    assert "people_db" in outcome.reason or "people_db" in outcome.guidance
+    assert "conversation_db" in outcome.reason or "conversation_db" in outcome.guidance
     assert fx.bundle_version(install.bundle_path) == "0.0.1"
 
 
@@ -407,7 +407,6 @@ def test_a_health_check_that_raises_is_a_failed_health_check(tmp_path):
 
 def test_a_failed_health_check_restores_the_state_it_migrated(tmp_path):
     seed, public, artifact, install = _prepare(tmp_path, state=build_legacy_state)
-    before = _people_rows(install.state_root)
     versions_before = _versions(install.state_root)
 
     outcome = _apply(
@@ -421,7 +420,6 @@ def test_a_failed_health_check_restores_the_state_it_migrated(tmp_path):
     assert outcome.status is UpdateStatus.ROLLED_BACK
     assert outcome.backup_id is not None
     assert _versions(install.state_root) == versions_before
-    assert _people_rows(install.state_root) == before
     assert fx.bundle_version(install.bundle_path) == "0.0.1"
 
 
@@ -430,12 +428,11 @@ def test_a_failed_migration_rolls_the_state_back_and_leaves_the_bundle_alone(
 ):
     seed, public, artifact, install = _prepare(tmp_path, state=build_legacy_state)
     versions_before = _versions(install.state_root)
-    people_before = _people_rows(install.state_root)
 
     def broken(root, *, plan=None, backup=None):
         return migrations.MigrationOutcome(
             backup_id=backup.backup_id if backup else None,
-            error="people_db: the step raised",
+            error="conversation_db: the step raised",
         )
 
     monkeypatch.setattr(migrations, "apply_migrations", broken)
@@ -444,7 +441,6 @@ def test_a_failed_migration_rolls_the_state_back_and_leaves_the_bundle_alone(
     assert outcome.stage is UpdateStage.MIGRATE
     assert outcome.status is UpdateStatus.ROLLED_BACK
     assert _versions(install.state_root) == versions_before
-    assert _people_rows(install.state_root) == people_before
     assert fx.bundle_version(install.bundle_path) == "0.0.1"
 
 
@@ -496,7 +492,6 @@ def test_a_backup_that_cannot_be_written_stops_the_update(tmp_path, monkeypatch)
 
 def test_rollback_puts_the_previous_bundle_and_state_back(tmp_path):
     seed, public, artifact, install = _prepare(tmp_path, state=build_legacy_state)
-    people_before = _people_rows(install.state_root)
     versions_before = _versions(install.state_root)
 
     applied = _apply(fx.document(artifact, seed), install, artifact, public)
@@ -509,7 +504,6 @@ def test_rollback_puts_the_previous_bundle_and_state_back(tmp_path):
     assert reverted.status is UpdateStatus.ROLLED_BACK, reverted.reason
     assert fx.bundle_version(install.bundle_path) == "0.0.1"
     assert _versions(install.state_root) == versions_before
-    assert _people_rows(install.state_root) == people_before
 
 
 def test_rollback_with_nothing_to_roll_back_to_says_so(tmp_path):
@@ -531,28 +525,3 @@ def _versions(root: Path) -> dict[str, int | None]:
         if migrations.store_present(root, spec)
     }
 
-
-def _people_rows(root: Path) -> list[tuple]:
-    """The person file as content, over the columns the old schema had."""
-    path = root / "people.db"
-    if not path.is_file():
-        return []
-    conn = sqlite3.connect(path)
-    conn.row_factory = sqlite3.Row
-    try:
-        rows = conn.execute("SELECT * FROM people ORDER BY person_id").fetchall()
-        columns = (
-            "person_id",
-            "apollo_id",
-            "first_name",
-            "last_name",
-            "title",
-            "company",
-            "email",
-            "linkedin_url",
-            "sequence_state",
-            "target",
-        )
-        return [tuple(row[name] for name in columns) for row in rows]
-    finally:
-        conn.close()

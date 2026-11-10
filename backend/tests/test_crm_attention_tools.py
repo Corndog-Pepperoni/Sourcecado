@@ -168,8 +168,8 @@ def test_proposal_source_access_is_required_even_for_exact_director_acceptance(t
         expected_version=0, sources=[], fingerprint="private-proposal", reason="Private suggestion")
     # A saved proposal may outlive the source permission of the current chat.
     with people.crm_transaction():
-        people._conn.execute("UPDATE crm_proposals SET source_refs=? WHERE proposal_id=?",
-            (json.dumps([source["id"]]), proposal["proposal_id"]))
+        people._conn.execute("UPDATE crm_proposals SET source_refs=%s WHERE user_id = %s AND proposal_id=%s",
+            (json.dumps([source["id"]]), people._user_id, proposal["proposal_id"]))
     args = {"proposal_id": proposal["proposal_id"], "resolution": "accept", "expected_version": 1,
         "expected_target_version": 0, "operation_id": "private-proposal-accept", "reason": "Director request"}
     text = f"Accept suggestion {proposal['proposal_id']}"

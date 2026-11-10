@@ -86,6 +86,7 @@ class AnalysisService:
                  failovers: tuple[Any, ...] = (), allowed_source_ids: set[str] | None = None,
                  budget_policy: RunBudgetPolicy | None = None, timezone: str = DEFAULT_TIMEZONE):
         self.people = people
+        self.user_id = people._user_id
         self.provider = provider
         self.failovers = failovers
         self.reader = reader
@@ -93,25 +94,22 @@ class AnalysisService:
         self.budget_policy = budget_policy or RunBudgetPolicy(elapsed_seconds=90)
         self.timezone = validate_timezone(timezone)
 
-    def _require_schema(self) -> None:
-        self.people.require_crm_schema()
-
     def _local(self, pid: str) -> tuple[dict, list[dict], list[dict]]:
-        with self.people._lock:
+        with self.people.transaction():
             person = self.people.get(pid)
             if person is None:
                 raise ValueError("unknown person")
             person["descriptions"] = self.people.descriptions(pid)
-            person["tasks"] = [dict(row) for row in self.people._conn.execute("SELECT * FROM person_tasks WHERE person_id=? ORDER BY task_id", (pid,))]
+            person["tasks"] = [dict(row) for row in self.people._conn.execute("SELECT * FROM person_tasks WHERE user_id = %s AND person_id=%s ORDER BY task_id", (self.user_id, pid))]
             attachments = [self.people._attachment_dict(r) for r in self.people._conn.execute(
-                "SELECT * FROM person_attachments WHERE person_id = ? AND record_type = 'source_ref' ORDER BY id", (pid,))]
+                "SELECT * FROM person_attachments WHERE user_id = %s AND person_id = %s AND record_type = 'source_ref' ORDER BY id", (self.user_id, pid))]
             events = [e for e in self.people.timeline(pid) if e["source"] == "gmail"]
             return person, attachments, events
 
     def _guard(self, pid: str) -> str:
         # Attribution also depends on other people sharing a mailbox/thread.
         # Include that index in the transaction-time check, not only this file.
-        with self.people._lock:
+        with self.people.transaction():
             index = build_index(self.people)
             attribution = {
                 "threads": {key: [(s.person_id, s.recipient) for s in sent] for key, sent in index.threads.items()},
@@ -123,7 +121,7 @@ class AnalysisService:
     def _current_sources(self, pid: str, manifest: list[dict]) -> None:
         # Re-read permissions and identity, including aliases for the same mail.
         # This lock ends before connector/model I/O; no transaction spans I/O.
-        with self.people._lock:
+        with self.people.transaction():
             _person, refs, _events = self._local(pid)
             by_id = {ref["id"]: ref for ref in refs}
             try:
@@ -165,14 +163,14 @@ class AnalysisService:
     def _current_attribution(self, pid: str, inputs: list[AttributionInput]) -> None:
         # Compare against the pre-I/O index, never an end-of-collection snapshot.
         # Source pointer bookkeeping is deliberately outside this identity.
-        with self.people._lock:
+        with self.people.transaction():
             index = build_index(self.people)
             for item in inputs:
                 if self._attribution(pid, item.metadata, item.outbound, index) != item.fingerprint:
                     raise SourceInputChanged("ambiguous_attribution")
 
     def _collect(self, pid: str) -> EvidenceInput:
-        with self.people._lock:
+        with self.people.transaction():
             person, attachments, events = self._local(pid)
             index = build_index(self.people)
         candidates = {str(e["payload"].get("message_id")): e for e in events
@@ -248,14 +246,14 @@ class AnalysisService:
         return EvidenceInput(digest(evidence), self._guard(pid), manifest, messages, partial, reason, attribution)
 
     def state(self, pid: str) -> dict[str, Any]:
-        with self.people._lock:
+        with self.people.transaction():
             self.people._load_person_row(pid)
-            row = self.people._conn.execute("SELECT * FROM crm_analysis_state WHERE person_id = ?", (pid,)).fetchone()
+            row = self.people._conn.execute("SELECT * FROM crm_analysis_state WHERE user_id = %s AND person_id = %s", (self.user_id, pid)).fetchone()
             if row is None:
                 return {"person_id": pid, "latest_revision": 0, "analyzed_revision": 0, "attempts": 0, "outcome": "pending"}
             result = dict(row)
             result.pop("lease_token", None)
-            latest = self.people._conn.execute("SELECT * FROM crm_analysis_attempts WHERE person_id = ? ORDER BY rowid DESC LIMIT 1", (pid,)).fetchone()
+            latest = self.people._conn.execute("SELECT * FROM crm_analysis_attempts WHERE user_id = %s AND person_id = %s ORDER BY seq DESC LIMIT 1", (self.user_id, pid)).fetchone()
             if latest:
                 for key in ("provider", "model", "prompt_version", "estimated_cost_usd"):
                     result[key] = latest[key]
@@ -270,20 +268,20 @@ class AnalysisService:
             return result
 
     def pending(self, *, now: float | None = None, limit: int = 20) -> list[str]:
-        self._require_schema()
-        with self.people._lock:
+        with self.people.transaction():
             return [r[0] for r in self.people._conn.execute("""SELECT s.person_id FROM crm_analysis_state s
-                JOIN people p ON p.person_id=s.person_id WHERE p.deleted_at IS NULL
-                AND (latest_revision != analyzed_revision OR analysis_version != ?) AND attempts < 3
-                AND (next_retry_at IS NULL OR next_retry_at <= ?)
-                AND (lease_until IS NULL OR lease_until <= ?) ORDER BY s.updated_at LIMIT ?""",
-                (PROMPT_VERSION, now or time.time(), now or time.time(), min(max(limit, 1), 100)))]
+                JOIN people p ON p.user_id=s.user_id AND p.person_id=s.person_id
+                WHERE s.user_id=%s AND p.deleted_at IS NULL
+                AND (latest_revision != analyzed_revision OR analysis_version != %s) AND attempts < 3
+                AND (next_retry_at IS NULL OR next_retry_at <= %s)
+                AND (lease_until IS NULL OR lease_until <= %s) ORDER BY s.updated_at LIMIT %s""",
+                (self.user_id, PROMPT_VERSION, now or time.time(), now or time.time(), min(max(limit, 1), 100)))]
 
     def _collection_identity(self, pid: str) -> str:
-        with self.people._lock:
+        with self.people.transaction():
             _person, refs, events = self._local(pid)
             keys = {row["id"]: row["idempotency_key"] for row in self.people._conn.execute(
-                "SELECT id, idempotency_key FROM person_attachments WHERE person_id=? AND record_type='source_ref'", (pid,))}
+                "SELECT id, idempotency_key FROM person_attachments WHERE user_id = %s AND person_id=%s AND record_type='source_ref'", (self.user_id, pid))}
             mail = {str(event["payload"].get("message_id")): event["payload"] for event in events
                 if isinstance(event.get("payload"), dict) and event["payload"].get("message_id")}
             significant = []
@@ -317,72 +315,75 @@ class AnalysisService:
     def _prepare(self, pid: str) -> None:
         # Save known changed inputs before the first cancellable connector read.
         # An unavailable connector is not itself a new evidence revision.
-        with self.people._lock, self.people._conn:
+        with self.people.transaction():
             identity = self._collection_identity(pid)
             self.people._conn.execute("""INSERT INTO crm_analysis_state
-                (person_id, latest_revision, evidence_fingerprint, collection_fingerprint, updated_at)
-                VALUES (?, 1, 'collecting', ?, ?) ON CONFLICT(person_id) DO NOTHING""", (pid, identity, self.people._now()))
+                (user_id, person_id, latest_revision, evidence_fingerprint, collection_fingerprint, updated_at)
+                VALUES (%s, %s, 1, 'collecting', %s, %s) ON CONFLICT(user_id, person_id) DO NOTHING""",
+                (self.user_id, pid, identity, self.people._now()))
             self.people._conn.execute("""UPDATE crm_analysis_state SET latest_revision=latest_revision+1,
-                evidence_fingerprint='collecting', collection_fingerprint=?, attempts=0,
-                next_retry_at=NULL, failure_code=NULL, outcome='pending', updated_at=?
-                WHERE person_id=? AND collection_fingerprint != ?""", (identity, self.people._now(), pid, identity))
+                evidence_fingerprint='collecting', collection_fingerprint=%s, attempts=0,
+                next_retry_at=NULL, failure_code=NULL, outcome='pending', updated_at=%s
+                WHERE user_id = %s AND person_id=%s AND collection_fingerprint != %s""", (identity, self.people._now(), self.user_id, pid, identity))
             # This snapshot includes the current mail events while holding the
             # collection writer lock. A later message keeps its newer revision dirty.
-            self.people._conn.execute('UPDATE crm_analysis_state SET observed_collection_revision=latest_evidence_revision WHERE person_id=?',(pid,))
+            self.people._conn.execute('UPDATE crm_analysis_state SET observed_collection_revision=latest_evidence_revision WHERE user_id = %s AND person_id=%s',(self.user_id, pid))
 
     def _observe(self, pid: str, evidence: EvidenceInput) -> dict:
-        with self.people._lock, self.people._conn:
-            self.people._conn.execute("""INSERT INTO crm_analysis_state(person_id, updated_at) VALUES (?, ?)
-                ON CONFLICT(person_id) DO NOTHING""", (pid, self.people._now()))
+        with self.people.transaction():
+            self.people._conn.execute("""INSERT INTO crm_analysis_state(user_id, person_id, updated_at) VALUES (%s, %s, %s)
+                ON CONFLICT(user_id, person_id) DO NOTHING""", (self.user_id, pid, self.people._now()))
             self.people._conn.execute("""UPDATE crm_analysis_state SET latest_revision=CASE WHEN evidence_fingerprint='collecting'
                 THEN latest_revision ELSE latest_revision+1 END,
                 attempts=CASE WHEN evidence_fingerprint='collecting' THEN attempts ELSE 0 END,
-                evidence_fingerprint=?, collection_fingerprint=?, next_retry_at=NULL, failure_code=NULL, outcome='pending', updated_at=?
-                WHERE person_id=? AND evidence_fingerprint != ?""", (evidence.fingerprint, self._collection_identity(pid), self.people._now(), pid, evidence.fingerprint))
+                evidence_fingerprint=%s, collection_fingerprint=%s, next_retry_at=NULL, failure_code=NULL, outcome='pending', updated_at=%s
+                WHERE user_id = %s AND person_id=%s AND evidence_fingerprint != %s""", (evidence.fingerprint, self._collection_identity(pid), self.people._now(), self.user_id, pid, evidence.fingerprint))
         return self.state(pid)
 
     def _claim(self, pid: str, evidence: EvidenceInput, *, now: float, retry: bool, bypass_backoff: bool = False) -> tuple[str | None, str]:
-        with self.people._lock, self.people._conn:
-            self.people._conn.execute("BEGIN IMMEDIATE")
-            row = self.people._conn.execute("SELECT * FROM crm_analysis_state WHERE person_id=?", (pid,)).fetchone()
+        with self.people.transaction():
+            self.people.lock_writes()
+            row = self.people._conn.execute("SELECT * FROM crm_analysis_state WHERE user_id = %s AND person_id=%s", (self.user_id, pid)).fetchone()
             if row["lease_until"] and row["lease_until"] > now:
                 return None, "running"
             if retry:
-                self.people._conn.execute("UPDATE crm_analysis_state SET attempts=0, next_retry_at=NULL WHERE person_id=?", (pid,))
+                self.people._conn.execute("UPDATE crm_analysis_state SET attempts=0, next_retry_at=NULL WHERE user_id = %s AND person_id=%s", (self.user_id, pid))
             elif row["attempts"] >= MAX_ATTEMPTS:
                 return None, "retry_required"
             elif not bypass_backoff and row["next_retry_at"] and row["next_retry_at"] > now:
                 return None, "pending"
             if row["lease_token"]:
-                self.people._conn.execute("UPDATE crm_analysis_attempts SET outcome='interrupted', failure_code='interrupted', updated_at=? WHERE attempt_id=? AND outcome='running'",
-                    (self.people._now(), row["lease_token"]))
+                self.people._conn.execute("UPDATE crm_analysis_attempts SET outcome='interrupted', failure_code='interrupted', updated_at=%s WHERE user_id = %s AND attempt_id=%s AND outcome='running'",
+                    (self.people._now(), self.user_id, row["lease_token"]))
             token = "analysis_" + uuid.uuid4().hex
-            self.people._conn.execute("""UPDATE crm_analysis_state SET attempts=attempts+1, lease_token=?,
-                lease_until=?, outcome='running', updated_at=? WHERE person_id=?""", (token, now+LEASE_SECONDS, self.people._now(), pid))
-            self.people._conn.execute("""INSERT INTO crm_analysis_attempts(attempt_id, person_id, input_revision,
+            self.people._conn.execute("""UPDATE crm_analysis_state SET attempts=attempts+1, lease_token=%s,
+                lease_until=%s, outcome='running', updated_at=%s WHERE user_id = %s AND person_id=%s""", (token, now+LEASE_SECONDS, self.people._now(), self.user_id, pid))
+            self.people._conn.execute("""INSERT INTO crm_analysis_attempts(user_id, attempt_id, person_id, input_revision,
                 evidence_fingerprint, manifest_json, prompt_version, outcome, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, 'running', ?, ?)""", (token, pid, row["latest_revision"],
+                VALUES (%s, %s, %s, %s, %s, %s, %s, 'running', %s, %s)""", (self.user_id, token, pid, row["latest_revision"],
                 evidence.fingerprint, json.dumps(evidence.manifest), PROMPT_VERSION, self.people._now(), self.people._now()))
             return token, "running"
 
     def _finish(self, pid: str, token: str, outcome: str, failure: str | None, *, now: float,
                 telemetry: dict | None = None, changes: list | None = None, proposals: list | None = None) -> None:
         # Caller owns the transaction, including successful description/proposal writes.
-        row = self.people._conn.execute("SELECT * FROM crm_analysis_state WHERE person_id=?", (pid,)).fetchone()
+        row = self.people._conn.execute("SELECT * FROM crm_analysis_state WHERE user_id = %s AND person_id=%s", (self.user_id, pid)).fetchone()
         telemetry = telemetry or {}
-        self.people._conn.execute("""UPDATE crm_analysis_attempts SET outcome=?, failure_code=?, provider=?, model=?,
-            usage_json=?, estimated_cost_usd=?, budget_json=?, change_ids=?, proposal_ids=?, updated_at=? WHERE attempt_id=?""",
+        self.people._conn.execute("""UPDATE crm_analysis_attempts SET outcome=%s, failure_code=%s, provider=%s, model=%s,
+            usage_json=%s, estimated_cost_usd=%s, budget_json=%s, change_ids=%s, proposal_ids=%s, updated_at=%s
+            WHERE user_id=%s AND attempt_id=%s""",
             (outcome, failure, telemetry.get("provider"), telemetry.get("model"), json.dumps(telemetry.get("usage")),
              telemetry.get("estimated_cost_usd"), json.dumps(telemetry.get("budget")), json.dumps(changes or []),
-             json.dumps(proposals or []), self.people._now(), token))
+             json.dumps(proposals or []), self.people._now(), self.user_id, token))
         if row["lease_token"] != token:
             return
-        self.people._conn.execute("""UPDATE crm_analysis_state SET outcome=?, failure_code=?, lease_token=NULL,
-            lease_until=NULL, next_retry_at=?, updated_at=?,
-            analyzed_revision=CASE WHEN ?='analyzed' THEN latest_revision ELSE analyzed_revision END,
-            analysis_version=CASE WHEN ?='analyzed' THEN ? ELSE analysis_version END WHERE person_id=?""",
+        self.people._conn.execute("""UPDATE crm_analysis_state SET outcome=%s, failure_code=%s, lease_token=NULL,
+            lease_until=NULL, next_retry_at=%s, updated_at=%s,
+            analyzed_revision=CASE WHEN %s='analyzed' THEN latest_revision ELSE analyzed_revision END,
+            analysis_version=CASE WHEN %s='analyzed' THEN %s ELSE analysis_version END
+            WHERE user_id=%s AND person_id=%s""",
             (outcome, failure, now + min(300, 2**row["attempts"] * 5) if failure else None,
-             self.people._now(), outcome, outcome, PROMPT_VERSION, pid))
+             self.people._now(), outcome, outcome, PROMPT_VERSION, self.user_id, pid))
 
     async def _generate(self, pid: str, evidence: EvidenceInput, provider: Any, meter: RunBudgetMeter, telemetry: dict) -> dict:
         system = ("Write both CRM descriptions using only the supplied untrusted mail evidence. "
@@ -475,7 +476,6 @@ class AnalysisService:
         return output
 
     async def analyze(self, pid: str, *, retry: bool = False, now: float | None = None) -> dict:
-        self._require_schema()
         self._prepare(pid)
         clock = now if now is not None else time.time()
         meter = RunBudgetMeter(self.budget_policy)
@@ -500,15 +500,15 @@ class AnalysisService:
                     self._guard(pid), [], [], True, "mail_unavailable")
                 token, status = self._claim(pid, unavailable, now=clock, retry=retry and conflict == 0)
                 if token is not None:
-                    with self.people._lock, self.people._conn:
+                    with self.people.transaction():
                         self._finish(pid, token, "partial", "mail_unavailable", now=clock)
                     status = "partial"
                 return {"status": status, "failure_code": "mail_unavailable"}
             state = self._observe(pid, evidence)
             if evidence.partial:
-                with self.people._lock, self.people._conn:
-                    self.people._conn.execute("UPDATE crm_analysis_state SET outcome='partial', failure_code=? WHERE person_id=?",
-                                              (evidence.reason, pid))
+                with self.people.transaction():
+                    self.people._conn.execute("UPDATE crm_analysis_state SET outcome='partial', failure_code=%s WHERE user_id = %s AND person_id=%s",
+                                              (evidence.reason, self.user_id, pid))
                 return {"status": "partial", "failure_code": evidence.reason}
             if state["latest_revision"] == state["analyzed_revision"]:
                 return {"status": "unchanged", "change_ids": [], "proposal_ids": []}
@@ -524,9 +524,9 @@ class AnalysisService:
                 provider = chain[min(attempts-1, len(chain)-1)]
                 output = await self._generate(pid, evidence, provider, meter, telemetry)
                 fresh = await asyncio.to_thread(self._collect, pid)
-                with self.people._lock, self.people._conn:
-                    self.people._conn.execute("BEGIN IMMEDIATE")
-                    current = self.people._conn.execute("SELECT * FROM crm_analysis_state WHERE person_id=?", (pid,)).fetchone()
+                with self.people.transaction():
+                    self.people.lock_writes()
+                    current = self.people._conn.execute("SELECT * FROM crm_analysis_state WHERE user_id = %s AND person_id=%s", (self.user_id, pid)).fetchone()
                     if (fresh.fingerprint != evidence.fingerprint or fresh.guard != evidence.guard
                             or self._guard(pid) != evidence.guard or current["evidence_fingerprint"] != evidence.fingerprint
                             or current["lease_token"] != token
@@ -545,17 +545,17 @@ class AnalysisService:
                     return {"status": "pending", "failure_code": "stale_input"}
                 return {"status": "analyzed", "change_ids": changes, "proposal_ids": proposals}
             except SourceInputChanged as exc:
-                with self.people._lock, self.people._conn:
+                with self.people.transaction():
                     self._finish(pid, token, "partial", exc.code, now=clock, telemetry=telemetry)
                 return {"status": "partial", "failure_code": exc.code}
             except asyncio.CancelledError:
-                with self.people._lock, self.people._conn:
+                with self.people.transaction():
                     self._finish(pid, token, "pending", "cancelled", now=clock, telemetry=telemetry)
                 raise
             except Exception as exc:
                 known = {"invalid_model_output", "incomplete_model_response", "insufficient_context", "budget_exhausted"}
                 code = str(exc) if isinstance(exc, ValueError) and str(exc) in known else "model_unavailable"
-                with self.people._lock, self.people._conn:
+                with self.people.transaction():
                     self._finish(pid, token, "failed", code, now=clock, telemetry=telemetry)
                 return {"status": "failed", "failure_code": code}
         raise AssertionError("bounded conflict loop fell through")
@@ -573,8 +573,8 @@ class AnalysisService:
                 continue
             refs = sorted({s["source_id"] for s in support})
             fingerprint = digest(sorted(({k: item[k] for k in ("source_id", "message_id", "body_fingerprint")} for item in support), key=lambda item: item["source_id"]))
-            prior = self.people._conn.execute("SELECT * FROM crm_proposals WHERE person_id=? AND intent_key=? AND support_source_fingerprint=?",
-                (pid, f"description:{slot}", fingerprint)).fetchone()
+            prior = self.people._conn.execute("SELECT * FROM crm_proposals WHERE user_id = %s AND person_id=%s AND intent_key=%s AND support_source_fingerprint=%s",
+                (self.user_id, pid, f"description:{slot}", fingerprint)).fetchone()
             if prior:
                 if prior["state"] == "pending":
                     proposals.append(prior["proposal_id"])
@@ -592,11 +592,11 @@ class AnalysisService:
                 changes.append(change_id)
             else:
                 proposals.append(proposal_id)
-            self.people._conn.execute("""INSERT INTO crm_proposals(proposal_id, person_id, target_kind, target_slot,
+            self.people._conn.execute("""INSERT INTO crm_proposals(user_id, proposal_id, person_id, target_kind, target_slot,
                 proposed_value, expected_target_version, reason, source_refs, intent_key, support_source_fingerprint,
                 input_revision, state, resolution, change_id, created_at, updated_at)
-                VALUES (?, ?, 'description', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (proposal_id, pid, slot, value["text"], current["version"], output["reason"], json.dumps(refs),
+                VALUES (%s, %s, %s, 'description', %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+                (self.user_id, proposal_id, pid, slot, value["text"], current["version"], output["reason"], json.dumps(refs),
                  f"description:{slot}", fingerprint, revision, "accepted" if change_id else "pending",
                  "automatic" if change_id else None, change_id, self.people._now(), self.people._now()))
         task_changes, task_proposals = EmailTaskWriter(self.people, allowed=self.allowed, timezone=self.timezone).apply(
@@ -606,10 +606,10 @@ class AnalysisService:
     def proposals(self, pid: str, *, state: str = "pending") -> list[dict]:
         if state not in {"pending", "accepted", "dismissed"}:
             raise ValueError("invalid proposal state")
-        with self.people._lock:
+        with self.people.transaction():
             self.people._load_person_row(pid)
             result = []
-            for row in self.people._conn.execute("SELECT * FROM crm_proposals WHERE person_id=? AND state=? ORDER BY created_at", (pid, state)):
+            for row in self.people._conn.execute("SELECT * FROM crm_proposals WHERE user_id = %s AND person_id=%s AND state=%s ORDER BY created_at", (self.user_id, pid, state)):
                 item = dict(row)
                 item.pop("resolution_receipt_json", None)
                 item["source_refs"] = json.loads(item["source_refs"])
@@ -624,10 +624,10 @@ class AnalysisService:
             raise ValueError("expected_version must be a positive integer")
         request_fingerprint = digest({"person_id": pid, "proposal_id": proposal_id,
             "action": action, "expected_version": expected_version})
-        with self.people._lock, self.people._conn:
-            self.people._conn.execute("BEGIN IMMEDIATE")
+        with self.people.transaction():
+            self.people.lock_writes()
             self.people._load_person_row(pid)
-            row = self.people._conn.execute("SELECT * FROM crm_proposals WHERE person_id=? AND proposal_id=?", (pid, proposal_id)).fetchone()
+            row = self.people._conn.execute("SELECT * FROM crm_proposals WHERE user_id = %s AND person_id=%s AND proposal_id=%s", (self.user_id, pid, proposal_id)).fetchone()
             if row is None:
                 raise ValueError("unknown proposal")
             refs = source_ids(self.people, pid, json.loads(row["source_refs"]), self.allowed)
@@ -668,7 +668,7 @@ class AnalysisService:
                 change_id = result["change"]["change_id"] if result["change"] else None
             response = {"proposal_id": proposal_id, "state": "accepted" if action == "accept" else "dismissed", "change_id": change_id}
             receipt = json.dumps({"fingerprint": request_fingerprint, "response": response})
-            self.people._conn.execute("""UPDATE crm_proposals SET state=?, resolution=?, change_id=?,
-                resolution_receipt_json=?, version=version+1, updated_at=? WHERE proposal_id=?""",
-                (response["state"], "director", change_id, receipt, self.people._now(), proposal_id))
+            self.people._conn.execute("""UPDATE crm_proposals SET state=%s, resolution=%s, change_id=%s,
+                resolution_receipt_json=%s, version=version+1, updated_at=%s WHERE user_id = %s AND proposal_id=%s""",
+                (response["state"], "director", change_id, receipt, self.people._now(), self.user_id, proposal_id))
             return response

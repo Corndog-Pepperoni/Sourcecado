@@ -52,8 +52,8 @@ def test_status_change_uses_the_ui_service_and_records_an_undoable_change(tmp_pa
     assert ok, saved
     assert saved["sequence"] == {"state": "in_conversation"}
     assert people.get(pid)["sequence_state"] == "in_conversation"
-    row = people._conn.execute("SELECT * FROM crm_changes WHERE change_id=?",
-                               (saved["change"]["change_id"],)).fetchone()
+    row = people._conn.execute("SELECT * FROM crm_changes WHERE user_id=%s AND change_id=%s",
+                               (people._user_id, saved["change"]["change_id"])).fetchone()
     assert (row["entity_type"], row["actor"], row["session_id"], row["run_id"]) == (
         "status", "assistant", "chat-crm", "run-crm")
     assert row["reason"] == "Director asked to move the sequence"
@@ -139,7 +139,7 @@ def test_board_transition_records_a_status_change_that_crm_undo_change_reverses(
     assert ok, moved
     assert moved["person"]["sequence_state"] == "in_conversation"
     change_id = moved["change"]["change_id"]
-    row = people._conn.execute("SELECT * FROM crm_changes WHERE change_id=?", (change_id,)).fetchone()
+    row = people._conn.execute("SELECT * FROM crm_changes WHERE user_id=%s AND change_id=%s", (people._user_id, change_id)).fetchone()
     assert (row["entity_type"], row["entity_id"], row["actor"], row["session_id"], row["run_id"]) == (
         "status", pid, "assistant", "chat-crm", "run-crm")
     assert (json.loads(row["before_json"]), json.loads(row["after_json"])) == (
@@ -170,11 +170,11 @@ def test_board_transition_records_a_status_change_that_crm_undo_change_reverses(
 def test_board_transition_keeps_the_assistant_sequence_guards(tmp_path, state, error):
     people, pid = bound(tmp_path)
     before = people.get(pid)
-    changes = people._conn.execute("SELECT COUNT(*) FROM crm_changes").fetchone()[0]
+    changes = people._conn.execute("SELECT COUNT(*) FROM crm_changes WHERE user_id=%s", (people._user_id,)).fetchone()[0]
     ok, refused = board_transition(people, pid, state, "No evidence on file")
     assert not ok and error in refused["error"], refused
     assert people.get(pid) == before
-    assert people._conn.execute("SELECT COUNT(*) FROM crm_changes").fetchone()[0] == changes
+    assert people._conn.execute("SELECT COUNT(*) FROM crm_changes WHERE user_id=%s", (people._user_id,)).fetchone()[0] == changes
 
 
 def test_board_transition_to_done_after_an_outcome_is_undoable(tmp_path):
