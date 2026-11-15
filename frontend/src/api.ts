@@ -1,3 +1,4 @@
+import { currentAccessToken, isHosted } from "./auth";
 import {
   parseChatEvent,
   parseSocketEvent,
@@ -158,6 +159,8 @@ const httpBase = (): string =>
   "";
 
 const apiToken = (): string =>
+  // Hosted mode: the signed-in Supabase session's access token.
+  isHosted() ? currentAccessToken() :
   window.__CLUB_API_TOKEN__ ||
   // Vite resolves development credentials in serve mode only. Reading a
   // VITE_* secret here would also embed it in the production bundle.
@@ -2638,8 +2641,6 @@ export function openChat(onEvent: (event: SourcecadoSocketEvent) => void): {
   approve: (id: string, decision: "allow" | "deny") => CommandDelivery;
   close: () => void;
 } {
-  const token = apiToken();
-  const protocols = token ? ["club", token] : ["club"];
   let ws: WebSocket | null = null;
   let disposed = false;
   let terminal = false;
@@ -2767,6 +2768,10 @@ export function openChat(onEvent: (event: SourcecadoSocketEvent) => void): {
   }
 
   function connect() {
+    // Read the token on every connect: a hosted session refreshes its token,
+    // and a reconnect must not offer the expired one.
+    const token = apiToken();
+    const protocols = token ? ["club", token] : ["club"];
     const socket = new WebSocket(`${wsBase()}/ws/chat`, protocols);
     ws = socket;
     socket.onopen = () => {

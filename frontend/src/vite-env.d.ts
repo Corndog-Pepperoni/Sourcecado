@@ -15,4 +15,7 @@ interface ImportMetaEnv {
   readonly VITE_SOURCECADO_CHANNEL?: string;
   readonly VITE_SOURCECADO_VERSION?: string;
   readonly VITE_SOURCECADO_COMMIT?: string;
+  /** Set only in a hosted build. Its presence turns on the Google sign-in gate. */
+  readonly VITE_SUPABASE_URL?: string;
+  readonly VITE_SUPABASE_ANON_KEY?: string;
 }
