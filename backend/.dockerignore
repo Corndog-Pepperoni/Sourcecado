@@ -1,0 +1,10 @@
+# Only requirements.lock and coworker/ go into the image.
+.venv/
+.env
+*.token
+tests/
+packaging/
+.pytest_cache/
+.eval-artifacts/
+**/__pycache__/
+**/*.pyc

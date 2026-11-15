@@ -1,4 +1,9 @@
-"""Launch Sourcecado on loopback with a per-run authentication token."""
+"""Launch Sourcecado.
+
+Local mode: on loopback with a per-run authentication token.
+Hosted mode (`SUPABASE_URL` set): Supabase sign-in, and a public address is
+allowed when the hosted settings are all present.
+"""
 
 from __future__ import annotations
 
@@ -9,8 +14,17 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
+import psycopg
+
+from coworker.db import WORKSPACE_USER_ID_ENV, close_default
+from coworker.hosted_auth import ALLOWED_EMAILS_ENV, SUPABASE_URL_ENV
 from coworker.provider import FakeProvider
 from coworker.server import TOKEN_ENV, create_app, state_dir
+
+# A public address needs all of these. Without them it would serve the data
+# of nobody in particular to anybody.
+HOSTED_SETTINGS = (SUPABASE_URL_ENV, ALLOWED_EMAILS_ENV, WORKSPACE_USER_ID_ENV)
+PUBLIC_URL_ENV = "PUBLIC_URL"
 
 MOCK_REPLY = ("This is the mock model. ", "No provider was called.")
 
@@ -86,6 +100,14 @@ def ensure_token(port: int) -> tuple[str, Path | None]:
     return token, path
 
 
+def missing_hosted_settings() -> list[str]:
+    return [name for name in HOSTED_SETTINGS if not os.environ.get(name, "").strip()]
+
+
+def _hosted() -> bool:
+    return bool(os.environ.get(SUPABASE_URL_ENV, "").strip())
+
+
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(prog="club-server")
     parser.add_argument("--host", default="127.0.0.1")
@@ -97,31 +119,58 @@ def main(argv: list[str] | None = None) -> None:
     )
     args = parser.parse_args(argv)
 
+    # Checked before any .env file is read: a public address needs the hosted
+    # settings in the real environment (the host's service variables).
     if args.host not in ("127.0.0.1", "localhost"):
-        print("refusing to bind off loopback in slice 1", file=sys.stderr)
-        sys.exit(2)
+        missing = missing_hosted_settings()
+        if missing:
+            print(
+                "refusing to bind off loopback: set " + ", ".join(missing),
+                file=sys.stderr,
+            )
+            sys.exit(2)
 
     _load_dotenv(state_dir() / ".env")
     _load_dotenv(Path(__file__).resolve().parent.parent / ".env")
-    token, token_path = ensure_token(args.port)
-    app = create_app(
-        token=token,
-        public_url=f"http://{args.host}:{args.port}",
-        **provider_overrides(args.mock_provider),
-    )
-    if not app.state.store.list_schedule()["jobs"]:
-        from coworker.automation.scheduler import next_monday_0900
 
-        app.state.store.add_job(
-            "0 9 * * 1",
-            "weekly sourcing check-in",
-            next_run_at=next_monday_0900(datetime.now()),
+    if _hosted():
+        # Sign-in replaces the shared token. This one is never accepted, and
+        # no token file is written.
+        token, token_path = secrets.token_hex(32), None
+    else:
+        token, token_path = ensure_token(args.port)
+    public_url = os.environ.get(PUBLIC_URL_ENV, "").strip() or (
+        f"http://{args.host}:{args.port}"
+    )
+    try:
+        app = create_app(
+            token=token,
+            public_url=public_url,
+            **provider_overrides(args.mock_provider),
         )
+        if not app.state.store.list_schedule()["jobs"]:
+            from coworker.automation.scheduler import next_monday_0900
+
+            app.state.store.add_job(
+                "0 9 * * 1",
+                "weekly sourcing check-in",
+                next_run_at=next_monday_0900(datetime.now()),
+            )
+    except psycopg.errors.ForeignKeyViolation:
+        close_default()
+        print(
+            f"{WORKSPACE_USER_ID_ENV} does not match a Supabase user in auth.users.",
+            file=sys.stderr,
+        )
+        sys.exit(2)
 
     print(f"Club backend  http://{args.host}:{args.port}")
+    if _hosted():
+        print("hosted mode: Supabase sign-in and the invite list guard every request.")
     if args.mock_provider:
         print("MOCK PROVIDER: every chat gets one fixed reply. No model is called.")
-    print(f"token file    {token_path or '(from ' + TOKEN_ENV + ')'}")
+    if not _hosted():
+        print(f"token file    {token_path or '(from ' + TOKEN_ENV + ')'}")
     print("window talks with header X-Club-Token. chat is /ws/chat.")
 
     try:

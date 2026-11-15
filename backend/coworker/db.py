@@ -23,6 +23,10 @@ DATABASE_URL_ENV = "DATABASE_URL"
 # slice S13). `supabase/seed.sql` creates the matching row.
 DEV_USER_ID = UUID("00000000-0000-4000-8000-000000000001")
 
+# The hosted demo has one owner for each deployment. When this is set, the
+# service runs as that user in place of DEV_USER_ID.
+WORKSPACE_USER_ID_ENV = "WORKSPACE_USER_ID"
+
 
 class Database:
     def __init__(self, url: str, *, max_size: int = 10) -> None:
@@ -63,12 +67,26 @@ def resolve(base_dir: str | Path) -> Binding:
     """The database and the user for a store that was opened at `base_dir`."""
     if _resolver is not None:
         return _resolver(Path(base_dir))
-    return _default_database(), DEV_USER_ID
+    return _default_database(), _service_user()
+
+
+def _service_user() -> UUID:
+    configured = os.environ.get(WORKSPACE_USER_ID_ENV, "").strip()
+    return UUID(configured) if configured else DEV_USER_ID
 
 
 def set_resolver(resolver: Callable[[Path], Binding] | None) -> None:
     global _resolver
     _resolver = resolver
+
+
+def close_default() -> None:
+    """Close the service pool, so an early exit leaves no pool thread behind."""
+    global _default
+    with _default_lock:
+        if _default is not None:
+            _default.close()
+            _default = None
 
 
 def _default_database() -> Database:

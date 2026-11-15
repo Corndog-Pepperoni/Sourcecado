@@ -16,13 +16,14 @@ import uuid
 from dataclasses import asdict
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterable
 
 from fastapi import Body, FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
 
 import coworker.turn as turn_runtime
+from coworker.hosted_auth import HostedAuth, Verdict, allowed_origins
 from coworker.automation.scheduler import (
     CADENCES,
     ROUTINE_TEMPLATES,
@@ -375,8 +376,10 @@ def _public_event(event: dict[str, Any]) -> dict[str, Any]:
     return {**event, "payload": payload}
 
 
-def _origin_allowed(origin: str | None) -> bool:
-    return origin is None or bool(_ALLOWED_ORIGIN_RE.match(origin))
+def _origin_allowed(origin: str | None, extra: Iterable[str] = ()) -> bool:
+    if origin is None or bool(_ALLOWED_ORIGIN_RE.match(origin)):
+        return True
+    return origin.rstrip("/") in extra
 
 
 def _tokens_match(got: str, expected: str) -> bool:
@@ -391,6 +394,23 @@ def _ws_token_ok(ws: WebSocket, expected: str) -> bool:
     query = (ws.query_params.get("token") or "").strip()
     candidates = parts + ([query] if query else [])
     return any(_tokens_match(c, expected) for c in candidates)
+
+
+def _ws_hosted_verdict(ws: WebSocket, auth: HostedAuth) -> Verdict:
+    """Hosted mode: the Supabase token is one entry of the subprotocol list.
+
+    The `?token=` query path is not read, so a token never sits in a URL.
+    """
+    header = ws.headers.get("sec-websocket-protocol", "")
+    parts = [p.strip() for p in header.split(",") if p.strip() and p.strip() != "club"]
+    verdict: Verdict = "invalid"
+    for part in parts:
+        result = auth.check(part)
+        if result == "ok":
+            return "ok"
+        if result == "not_invited":
+            verdict = "not_invited"
+    return verdict
 
 
 # Execution states that carry a final outcome; matches the overwrite guard in
@@ -433,9 +453,13 @@ def create_app(
     browser_opener: Callable[[str], bool] | None = None,
     telemetry_adapter: TelemetryAdapter | None = None,
     provider_failovers: tuple[Any, ...] | None = None,
+    hosted_auth: HostedAuth | None = None,
 ) -> FastAPI:
     if not token:
         raise ValueError("backend token must be non-empty")
+    # Hosted mode when SUPABASE_URL is set. Tests pass their own HostedAuth.
+    hosted_auth = hosted_auth or HostedAuth.from_env()
+    extra_origins = allowed_origins()
 
     @asynccontextmanager
     async def lifespan(app):
@@ -1182,6 +1206,29 @@ def create_app(
         )
         return claim, receipt, ok, result
 
+    # Registered before CORS so that CORS wraps it: a browser can then read the
+    # 401 and 403 answers of the gate, such as `not_invited`.
+    @app.middleware("http")
+    async def gate(request: Request, call_next):
+        if request.method == "OPTIONS":
+            return await call_next(request)
+        if request.url.path == "/healthz":
+            return await call_next(request)
+        if request.url.path in {"/v1/gmail/callback", "/v1/mcp/oauth/callback"}:
+            return await call_next(request)
+        if not _origin_allowed(request.headers.get("origin"), extra_origins):
+            return JSONResponse({"error": "origin_not_allowed"}, status_code=403)
+        got = request.headers.get(TOKEN_HEADER, "")
+        if hosted_auth is not None:
+            verdict = hosted_auth.check(got)
+            if verdict == "not_invited":
+                return JSONResponse({"error": "not_invited"}, status_code=403)
+            if verdict != "ok":
+                return JSONResponse({"error": "unauthorized"}, status_code=401)
+        elif not _tokens_match(got, app.state.token):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        return await call_next(request)
+
     app.add_middleware(
         CORSMiddleware,
         allow_origins=[
@@ -1190,24 +1237,16 @@ def create_app(
             "http://127.0.0.1:5180",
             "http://localhost:5180",
             "tauri://localhost",
+            *extra_origins,
         ],
         allow_credentials=True,
         allow_methods=["*"],
-        allow_headers=["*"],
+        allow_headers=["*", TOKEN_HEADER],
     )
 
-    @app.middleware("http")
-    async def gate(request: Request, call_next):
-        if request.method == "OPTIONS":
-            return await call_next(request)
-        if request.url.path in {"/v1/gmail/callback", "/v1/mcp/oauth/callback"}:
-            return await call_next(request)
-        if not _origin_allowed(request.headers.get("origin")):
-            return JSONResponse({"error": "origin_not_allowed"}, status_code=403)
-        got = request.headers.get(TOKEN_HEADER, "")
-        if not _tokens_match(got, app.state.token):
-            return JSONResponse({"error": "unauthorized"}, status_code=401)
-        return await call_next(request)
+    @app.get("/healthz")
+    def healthz():
+        return {"ok": True}
 
     @app.get("/v1/health")
     def health():
@@ -3528,9 +3567,21 @@ def create_app(
 
     @app.websocket("/ws/chat")
     async def ws_chat(ws: WebSocket) -> None:
-        if not _ws_token_ok(ws, app.state.token) or not _origin_allowed(
-            ws.headers.get("origin")
-        ):
+        if not _origin_allowed(ws.headers.get("origin"), extra_origins):
+            await ws.close(code=1008)
+            return
+        if hosted_auth is not None:
+            verdict = _ws_hosted_verdict(ws, hosted_auth)
+            if verdict == "not_invited":
+                # Accept first: a close before accept reaches a browser only as
+                # a failed handshake (code 1006), so it could not see the reason.
+                await ws.accept(subprotocol="club")
+                await ws.close(code=4403, reason="not_invited")
+                return
+            if verdict != "ok":
+                await ws.close(code=1008)
+                return
+        elif not _ws_token_ok(ws, app.state.token):
             await ws.close(code=1008)
             return
         await ws.accept(subprotocol="club")
