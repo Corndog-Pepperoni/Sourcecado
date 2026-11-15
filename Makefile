@@ -4,7 +4,7 @@ GUI := frontend
 # The local Supabase database from `make db-up` (port in supabase/config.toml).
 DATABASE_URL ?= postgresql://postgres:postgres@127.0.0.1:53322/postgres
 
-.PHONY: setup backend backend-mock gui native db-up db-reset test test-python test-gui eval eval-sourcing build doctor doctor-repair secret-scan build-backend smoke-test test-update update-status update-rollback update-manifest update-verify
+.PHONY: check check-1 check-2 check-3 check-4 check-5 check-6 setup backend backend-mock gui native db-up db-reset test test-python test-gui eval eval-sourcing build doctor doctor-repair secret-scan build-backend smoke-test test-update update-status update-rollback update-manifest update-verify
 
 setup:
 	$(PYTHON) -m venv $(VENV)
@@ -36,6 +36,44 @@ test-python:
 
 test-gui:
 	npm --prefix $(GUI) test
+
+# --- starter checks ---------------------------------------------------------
+# One command for each piece that you write: `make check-1` to `make check-6`.
+# The last line is the answer: PIECE N: PASS, or PIECE N: NOT YET.
+# `make check` shows all six. Checks 1, 2, 4 and 5 need `make db-up` first.
+# Check 3 needs Docker. Do the pieces in order: a check needs the pieces before it.
+
+PIECE_TEST := cd backend && .venv/bin/pytest -q -x --tb=short
+verdict = && printf '\nPIECE $(1): PASS\n' || printf '\nPIECE $(1): NOT YET. The first failure above tells you what is wrong.\n'
+
+# Piece 1: Database.tx and _service_user in backend/coworker/db.py
+check-1:
+	@( $(PIECE_TEST) tests/test_db.py tests/test_hosted_demo.py::test_resolve_returns_workspace_user_id_when_set ) $(call verdict,1)
+
+# Piece 2: the table meeting_candidates in supabase/migrations/20261110000800_meeting_evidence.sql
+check-2:
+	@( $(PIECE_TEST) tests/test_meeting_evidence.py tests/test_row_level_security.py ) $(call verdict,2)
+
+# Piece 3: backend/Dockerfile
+check-3:
+	@( sh backend/tests/check_container.sh ) $(call verdict,3)
+
+# Piece 4: /healthz in backend/coworker/server.py, and the public-address rule in backend/coworker/run.py
+check-4:
+	@( $(PIECE_TEST) tests/test_hosted_demo.py -k "healthz or public_host or launcher" ) $(call verdict,4)
+
+# Piece 5: HostedAuth.check in backend/coworker/hosted_auth.py
+check-5:
+	@( $(PIECE_TEST) tests/test_hosted_demo.py ) $(call verdict,5)
+
+# Piece 6: frontend/src/auth.ts and frontend/src/api.ts
+check-6:
+	@( cd $(GUI) && npx vitest run --config vitest.config.ts tests/authGate.test.tsx && npx tsc --noEmit ) $(call verdict,6)
+
+check:
+	@for n in 1 2 3 4 5 6; do \
+		if $(MAKE) -s check-$$n 2>/dev/null | grep -q "^PIECE $$n: PASS"; then echo "PIECE $$n: PASS"; else echo "PIECE $$n: NOT YET"; fi; \
+	done
 
 eval:
 	cd backend && .venv/bin/python -m coworker.evals --artifacts .eval-artifacts
