@@ -179,12 +179,28 @@ describe("hosted mode", () => {
     expect(screen.getByText("App content")).toBeInTheDocument();
   });
 
-  it("drops the session and returns to sign-in on 401", async () => {
+  it("stays signed in when a route answers 401 for another reason", async () => {
+    // A connector that is not connected answers 401. Found on the live demo:
+    // that 401 signed the person out a few seconds after sign-in.
     fake.state.session = session("access-1");
     render(<AuthGate><App /></AuthGate>);
     await screen.findByText("App content");
 
-    respondWith(401, { detail: "invalid token" });
+    respondWith(401, { error: "unauthorized" });
+    await act(async () => {
+      await getHealth().catch(() => undefined);
+    });
+
+    expect(screen.getByText("App content")).toBeInTheDocument();
+    expect(fake.auth.signOut).not.toHaveBeenCalled();
+  });
+
+  it("drops the session and returns to sign-in on 401 sign_in_required", async () => {
+    fake.state.session = session("access-1");
+    render(<AuthGate><App /></AuthGate>);
+    await screen.findByText("App content");
+
+    respondWith(401, { error: "sign_in_required" });
     await act(async () => {
       await getHealth().catch(() => undefined);
     });
