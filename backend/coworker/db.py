@@ -38,12 +38,19 @@ class Database:
 
         Commits when the block ends. Rolls back when the block raises.
         """
-        acting_as = user_id if isinstance(user_id, UUID) else UUID(user_id)
-        with self._pool.connection() as conn:
-            conn.execute(
-                "select set_config('app.user_id', %s, true)", (str(acting_as),)
-            )
-            yield conn
+        # YOUR TURN (block 1, piece 1): the one door to the database.
+        #
+        # 1. `user_id` can be a UUID or text. Make sure you hold a UUID. Text
+        #    that is not a UUID must raise ValueError, before any connection
+        #    is opened. `UUID(text)` does that.
+        # 2. Take one connection from `self._pool` in a `with` block. The pool
+        #    commits when the block ends and rolls back when it raises.
+        # 3. On that connection, run this SQL with the user id as text:
+        #        select set_config('app.user_id', %s, true)
+        #    The `true` means "for this transaction only".
+        # 4. `yield` the connection to the caller.
+        raise NotImplementedError("Write Database.tx first (block 1, piece 1).")
+        yield  # your code replaces these two lines
 
     def close(self) -> None:
         self._pool.close()
@@ -71,8 +78,12 @@ def resolve(base_dir: str | Path) -> Binding:
 
 
 def _service_user() -> UUID:
-    configured = os.environ.get(WORKSPACE_USER_ID_ENV, "").strip()
-    return UUID(configured) if configured else DEV_USER_ID
+    # YOUR TURN (block 1, piece 1): who owns the rows of this deployment.
+    #
+    # Read the environment variable named by WORKSPACE_USER_ID_ENV and strip
+    # the spaces. When it has a value, return it as a UUID. When it is empty
+    # or not set, return DEV_USER_ID.
+    return DEV_USER_ID
 
 
 def set_resolver(resolver: Callable[[Path], Binding] | None) -> None:
