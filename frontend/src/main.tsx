@@ -1,6 +1,7 @@
 import { Component, StrictMode, type ErrorInfo, type ReactNode } from "react";
 import { createRoot } from "react-dom/client";
 import { App } from "./App";
+import { AuthGate } from "./AuthGate";
 import "./styles.css";
 
 class Boundary extends Component<{ children: ReactNode }, { err: string | null }> {
@@ -26,7 +27,9 @@ class Boundary extends Component<{ children: ReactNode }, { err: string | null }
 createRoot(document.getElementById("root")!).render(
   <StrictMode>
     <Boundary>
-      <App />
+      <AuthGate>
+        <App />
+      </AuthGate>
     </Boundary>
   </StrictMode>
 );

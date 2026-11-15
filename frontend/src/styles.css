@@ -13,6 +13,7 @@
 @import "./styles/connections.css";
 @import "./styles/scheduled.css";
 @import "./styles/responsive.css";
+@import "./styles/auth.css";
 
 .person-mail-activity .person-timeline-entry,
 .person-mail-source {

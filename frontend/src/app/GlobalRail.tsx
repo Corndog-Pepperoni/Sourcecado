@@ -1,6 +1,7 @@
 import { useEffect, useId, useRef, useState, type FormEvent, type KeyboardEvent } from "react";
 
 import type { SessionRow } from "../api";
+import { isHosted, signOut } from "../auth";
 import { RailIcon, type RailIconName } from "./RailIcon";
 import type { AppRoute } from "./route";
 
@@ -252,6 +253,18 @@ export function GlobalRail({ open, collapsed, operator, route, sessions, schedul
             <strong className="operator-name">{operatorName}</strong>
             {operator?.persona && <span className="operator-persona">{operator.persona}</span>}
           </span>
+          {isHosted() && (
+            <button
+              type="button"
+              className="operator-sign-out"
+              aria-label="Sign out"
+              title={iconColumn ? undefined : "Sign out"}
+              data-tooltip={tip("Sign out")}
+              onClick={() => void signOut()}
+            >
+              <RailIcon name="signOut" />
+            </button>
+          )}
         </div>
       </nav>
     </aside>
