@@ -1,0 +1,121 @@
+/* Hosted sign-in gate: the loading, sign-in and not-invited screens. A
+   low-density moment, so it gets room and the owl mark, nothing more. */
+.auth-screen {
+  display: grid;
+  min-height: 100vh;
+  min-height: 100dvh;
+  place-items: center;
+  padding: 24px 16px;
+  background: var(--canvas);
+  color: var(--text);
+}
+
+.auth-card {
+  display: flex;
+  width: 100%;
+  max-width: 400px;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 16px;
+  padding: 32px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface);
+}
+
+.auth-mark {
+  display: block;
+  border-radius: 8px;
+  object-fit: cover;
+}
+
+.auth-card h1 {
+  margin: 0;
+  font-size: 24px;
+  font-weight: 600;
+  letter-spacing: -.01em;
+  line-height: 1.25;
+}
+
+.auth-card p {
+  margin: 0;
+  color: var(--muted);
+  font-size: 14px;
+  line-height: 1.5;
+}
+
+.auth-email {
+  color: var(--text);
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+
+.auth-button {
+  width: 100%;
+  min-height: 44px;
+  margin-top: 8px;
+  padding: 0 16px;
+  border: 1px solid var(--accent);
+  border-radius: 6px;
+  background: var(--accent);
+  color: var(--surface);
+  font: inherit;
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background-color 150ms ease-out, border-color 150ms ease-out;
+}
+
+.auth-button:hover {
+  border-color: var(--accent-deep);
+  background: var(--accent-deep);
+}
+
+.auth-button:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 3px;
+}
+
+.auth-card .auth-error {
+  padding: 8px 12px;
+  border-radius: 6px;
+  background: var(--error-bg);
+  color: var(--error);
+  font-size: 13px;
+}
+
+@media (max-width: 480px) {
+  .auth-card {
+    padding: 24px 20px;
+  }
+}
+
+/* Rail sign-out (hosted mode only), at the end of the operator block. */
+.operator-sign-out {
+  display: grid;
+  width: 32px;
+  height: 32px;
+  flex: 0 0 32px;
+  place-items: center;
+  margin-left: auto;
+  padding: 0;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+}
+
+.operator-sign-out:hover {
+  background: var(--raised);
+  color: var(--text);
+}
+
+.is-collapsed .operator-identity:has(.operator-sign-out) {
+  flex-direction: column;
+  gap: 4px;
+}
+
+.is-collapsed .operator-sign-out {
+  margin-left: 0;
+}
