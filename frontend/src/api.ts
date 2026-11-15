@@ -1,4 +1,4 @@
-import { currentAccessToken, isHosted } from "./auth";
+import { isHosted } from "./auth";
 import {
   parseChatEvent,
   parseSocketEvent,
@@ -161,7 +161,8 @@ const httpBase = (): string =>
 const apiToken = (): string =>
   // YOUR TURN (block 3, piece 6): send the login token with every request.
   // In hosted mode the token is `currentAccessToken()`. Put that call in
-  // place of the empty text "" on the next line.
+  // place of the empty text "" on the next line. Also add `currentAccessToken`
+  // to the import from "./auth" in the first line of this file.
   isHosted() ? "" :
   window.__CLUB_API_TOKEN__ ||
   // Vite resolves development credentials in serve mode only. Reading a
