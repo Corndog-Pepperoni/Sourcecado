@@ -111,19 +111,6 @@ def test_mutant_a_rollback_that_leaves_the_new_bundle_in_place_is_caught(
         )
 
 
-def test_mutant_a_rollback_that_leaves_the_state_migrated_is_caught(
-    tmp_path, monkeypatch
-):
-    """Defeat the state half: claim the backup was restored and restore nothing."""
-    monkeypatch.setattr(
-        migrations, "restore_backup", lambda root, backup_id: {"restored": []}
-    )
-    with pytest.raises(AssertionError):
-        exercise_tests.test_exercise_failed_update_restores_the_last_usable_version(
-            tmp_path
-        )
-
-
 def test_mutant_a_rollback_that_forgets_the_version_manifest_is_caught(
     tmp_path, monkeypatch
 ):

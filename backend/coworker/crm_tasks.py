@@ -2,9 +2,9 @@
 
 One task record backs both the global Tasks view in Contacts and the task list
 in a person file, so an edit in either place is the same saved row. Tasks live
-in `people.db` beside the person they belong to and share the PersonStore
-connection and lock, so a task, its change history and its operation receipt
-commit in one transaction.
+in the people store beside the person they belong to and share the
+PersonStore transaction, so a task, its change history and its operation
+receipt commit in one transaction.
 
 Every write carries an operation id. Replaying the same operation returns the
 original receipt instead of writing again; reusing the id for different
@@ -26,7 +26,6 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-import sqlite3
 import uuid
 from datetime import UTC, date, datetime
 from typing import TYPE_CHECKING, Any
@@ -37,6 +36,7 @@ from coworker.crm_sources import source_links, sources_visible
 
 if TYPE_CHECKING:
     from coworker.people import PersonStore
+    from coworker.people_db import Row
 
 TASK_STATES = ("open", "completed", "cancelled")
 TASK_ORIGINS = ("human", "assistant")
@@ -63,87 +63,6 @@ _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 _OPERATION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$")
 _TASK_ID_RE = re.compile(r"^task_[0-9a-f]{32}$")
 _CHANGE_ID_RE = re.compile(r"^chg_[0-9a-f]{32}$")
-
-# The column list of crm_changes, shared by the constructor DDL and the 3->4
-# rebuild in migrations.py so a fresh install and a migrated one match.
-CRM_CHANGES_V5_COLUMNS = """
-        change_id TEXT PRIMARY KEY,
-        person_id TEXT NOT NULL REFERENCES people(person_id),
-        entity_type TEXT NOT NULL CHECK (entity_type IN ('task')),
-        entity_id TEXT NOT NULL,
-        entity_version INTEGER NOT NULL CHECK (entity_version >= 1),
-        action TEXT NOT NULL CHECK (
-            action IN ('create', 'update', 'complete', 'reopen', 'cancel', 'undo')
-        ),
-        before_json TEXT,
-        after_json TEXT NOT NULL,
-        actor TEXT NOT NULL CHECK (actor IN ('director', 'assistant')),
-        reason TEXT NOT NULL,
-        source_refs TEXT NOT NULL DEFAULT '[]',
-        operation_id TEXT NOT NULL,
-        session_id TEXT,
-        run_id TEXT,
-        compensates_change_id TEXT REFERENCES crm_changes(change_id),
-        created_at TEXT NOT NULL
-"""
-CRM_CHANGES_COLUMNS = CRM_CHANGES_V5_COLUMNS.replace("IN ('task')", "IN ('task', 'description', 'attention', 'proposal', 'review', 'status', 'artifact', 'person_details')").replace("'cancel', 'undo')", "'cancel', 'undo', 'accept', 'dismiss')")
-CRM_CHANGES_INDEX_STATEMENTS: tuple[str, ...] = (
-    """
-    CREATE INDEX IF NOT EXISTS crm_changes_entity
-    ON crm_changes(entity_type, entity_id, created_at)
-    """,
-)
-
-# Executed one statement at a time, never through `executescript`, which
-# commits first: the migration step runs these inside its own transaction and
-# must be able to roll them back.
-CRM_TASK_STATEMENTS: tuple[str, ...] = (
-    """
-    CREATE TABLE IF NOT EXISTS person_tasks (
-        task_id TEXT PRIMARY KEY,
-        person_id TEXT NOT NULL REFERENCES people(person_id),
-        title TEXT NOT NULL CHECK (length(title) BETWEEN 1 AND 200),
-        details TEXT NOT NULL DEFAULT '' CHECK (length(details) <= 4000),
-        due_date TEXT CHECK (
-            due_date IS NULL
-            OR due_date GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]'
-        ),
-        due_timezone TEXT,
-        state TEXT NOT NULL DEFAULT 'open'
-            CHECK (state IN ('open', 'completed', 'cancelled')),
-        origin TEXT NOT NULL CHECK (origin IN ('human', 'assistant')),
-        protected_fields TEXT NOT NULL DEFAULT '[]',
-        source_refs TEXT NOT NULL DEFAULT '[]',
-        version INTEGER NOT NULL DEFAULT 1 CHECK (version >= 1),
-        created_at TEXT NOT NULL,
-        updated_at TEXT NOT NULL,
-        completed_at TEXT,
-        CHECK ((due_date IS NULL) = (due_timezone IS NULL))
-    )
-    """,
-    """
-    CREATE INDEX IF NOT EXISTS person_tasks_person_state_due
-    ON person_tasks(person_id, state, due_date)
-    """,
-    """
-    CREATE INDEX IF NOT EXISTS person_tasks_state_due
-    ON person_tasks(state, due_date, task_id)
-    """,
-    f"CREATE TABLE IF NOT EXISTS crm_changes ({CRM_CHANGES_COLUMNS})",
-    *CRM_CHANGES_INDEX_STATEMENTS,
-    """
-    CREATE TABLE IF NOT EXISTS crm_operations (
-        operation_id TEXT PRIMARY KEY,
-        fingerprint TEXT NOT NULL,
-        change_id TEXT NOT NULL REFERENCES crm_changes(change_id),
-        entity_type TEXT NOT NULL,
-        entity_id TEXT NOT NULL,
-        response_json TEXT NOT NULL,
-        created_at TEXT NOT NULL
-    )
-    """,
-)
-
 
 class TaskError(ValueError):
     """Invalid input. Maps to HTTP 400."""
@@ -276,13 +195,14 @@ class TaskService:
     def __init__(self, people: PersonStore) -> None:
         self._people = people
         # Shared with PersonStore on purpose: a task commits in the same
-        # transaction authority as the person it belongs to.
+        # transaction as the person it belongs to.
         self._conn = people._conn
         self._lock = people._lock
+        self._user_id = people._user_id
 
     # --- reads --------------------------------------------------------------
 
-    def _task_dict(self, row: sqlite3.Row) -> dict[str, Any]:
+    def _task_dict(self, row: Row) -> dict[str, Any]:
         return {
             "task_id": str(row["task_id"]),
             "person_id": str(row["person_id"]),
@@ -300,31 +220,33 @@ class TaskService:
             "completed_at": row["completed_at"],
         }
 
-    def _live_person(self, person_id: str) -> sqlite3.Row:
+    def _live_person(self, person_id: str) -> Row:
         row = self._conn.execute(
-            "SELECT * FROM people WHERE person_id = ? AND deleted_at IS NULL",
-            (person_id,),
+            "SELECT * FROM people WHERE user_id = %s AND person_id = %s AND deleted_at IS NULL",
+            (self._user_id, person_id),
         ).fetchone()
         if row is None:
             raise TaskNotFound("unknown person")
         return row
 
-    def _load_task(self, person_id: str, task_id: str) -> sqlite3.Row:
+    def _load_task(self, person_id: str, task_id: str) -> Row:
         row = self._conn.execute(
             """
             SELECT person_tasks.* FROM person_tasks
-            JOIN people ON people.person_id = person_tasks.person_id
-            WHERE person_tasks.task_id = ? AND person_tasks.person_id = ?
+            JOIN people ON people.user_id = person_tasks.user_id
+              AND people.person_id = person_tasks.person_id
+            WHERE person_tasks.user_id = %s
+              AND person_tasks.task_id = %s AND person_tasks.person_id = %s
               AND people.deleted_at IS NULL
             """,
-            (task_id, person_id),
+            (self._user_id, task_id, person_id),
         ).fetchone()
         if row is None:
             raise TaskNotFound("unknown task")
         return row
 
     def get(self, person_id: str, task_id: str, *, allowed_source_ids: set[str] | None = None) -> dict[str, Any]:
-        with self._lock:
+        with self._people.transaction():
             return self._project_task(self._task_dict(self._load_task(person_id, task_id)), allowed_source_ids)
 
     def _project_task(self, task: dict, allowed: set[str] | None = None) -> dict:
@@ -341,13 +263,13 @@ class TaskService:
     def _automatic_creation(self, change_id: str) -> bool:
         # Only the durable analysis binding authorizes creation Undo. Merely
         # executing as assistant (e.g. chat) is not automatic authority.
-        return self._conn.execute("""SELECT 1 FROM crm_proposals WHERE change_id=?
-            AND target_kind='task_create' AND resolution='automatic' AND state='accepted'""", (change_id,)).fetchone() is not None
+        return self._conn.execute("""SELECT 1 FROM crm_proposals WHERE user_id = %s AND change_id=%s
+            AND target_kind='task_create' AND resolution='automatic' AND state='accepted'""", (self._user_id, change_id)).fetchone() is not None
 
     def _project_response(self, response: dict, allowed: set[str] | None = None) -> dict:
         response = {**response, "task": self._project_task(response["task"], allowed)}
         if response.get("change"):
-            row = self._conn.execute("SELECT * FROM crm_changes WHERE change_id=?", (response["change"]["change_id"],)).fetchone()
+            row = self._conn.execute("SELECT * FROM crm_changes WHERE user_id = %s AND change_id=%s", (self._user_id, response["change"]["change_id"])).fetchone()
             response["change"] = {**response["change"], "source_links": source_links(self._people, row["person_id"], json.loads(row["source_refs"]), allowed), "can_undo": self._can_undo(row)}
         return response
 
@@ -376,16 +298,16 @@ class TaskService:
             raise TaskError("state must be open, completed or cancelled")
         limit = max(1, min(int(limit), LIST_LIMIT_MAX))
         offset=max(0,int(offset))
-        clauses = ["people.deleted_at IS NULL"]
-        params: list[Any] = []
-        clauses.append(f"person_tasks.state IN ({', '.join('?' for _ in states)})")
+        clauses = ["person_tasks.user_id = %s", "people.deleted_at IS NULL"]
+        params: list[Any] = [self._user_id]
+        clauses.append(f"person_tasks.state IN ({', '.join('%s' for _ in states)})")
         params.extend(states)
         if person_id is not None:
-            clauses.append("person_tasks.person_id = ?")
+            clauses.append("person_tasks.person_id = %s")
             params.append(person_id)
         if active_sequences_only:
             clauses.append("people.sequence_state IN ('open', 'in_conversation', 'done')")
-        with self._lock:
+        with self._people.transaction():
             if person_id is not None:
                 self._live_person(person_id)
             rows = self._conn.execute(
@@ -396,13 +318,14 @@ class TaskService:
                        people.company AS person_company,
                        people.sequence_state AS person_sequence_state
                 FROM person_tasks
-                JOIN people ON people.person_id = person_tasks.person_id
+                JOIN people ON people.user_id = person_tasks.user_id
+                  AND people.person_id = person_tasks.person_id
                 WHERE {" AND ".join(clauses)}
                 ORDER BY person_tasks.due_date IS NULL,
                          person_tasks.due_date,
                          person_tasks.created_at,
                          person_tasks.task_id
-                LIMIT ? OFFSET ?
+                LIMIT %s OFFSET %s
                 """,
                 (*params, limit + 1, offset),
             ).fetchall()
@@ -442,12 +365,12 @@ class TaskService:
     # --- operation receipts ------------------------------------------------
 
     def _replay(self, operation_id: str, fingerprint: str, *, legacy_fingerprint: str | None = None) -> dict[str, Any] | None:
-        if self._conn.execute("SELECT 1 FROM events WHERE external_key = ?",
-                              (f"crm-operation:{operation_id}",)).fetchone():
+        if self._conn.execute("SELECT 1 FROM events WHERE user_id = %s AND external_key = %s",
+                              (self._user_id, f"crm-operation:{operation_id}")).fetchone():
             raise TaskConflict("operation id already belongs to a description change", code="operation_conflict")
         row = self._conn.execute(
-            "SELECT fingerprint, response_json FROM crm_operations WHERE operation_id = ?",
-            (operation_id,),
+            "SELECT fingerprint, response_json FROM crm_operations WHERE user_id = %s AND operation_id = %s",
+            (self._user_id, operation_id),
         ).fetchone()
         if row is None:
             return None
@@ -492,13 +415,14 @@ class TaskService:
         self._conn.execute(
             """
             INSERT INTO crm_changes (
-                change_id, person_id, entity_type, entity_id, entity_version,
+                user_id, change_id, person_id, entity_type, entity_id, entity_version,
                 action, before_json, after_json, actor, reason, source_refs,
                 operation_id, session_id, run_id, compensates_change_id,
                 created_at
-            ) VALUES (?, ?, 'task', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (%s, %s, %s, 'task', %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             """,
             (
+                self._user_id,
                 change_id,
                 person_id,
                 task["task_id"],
@@ -520,11 +444,12 @@ class TaskService:
         self._conn.execute(
             """
             INSERT INTO crm_operations (
-                operation_id, fingerprint, change_id, entity_type, entity_id,
+                user_id, operation_id, fingerprint, change_id, entity_type, entity_id,
                 response_json, created_at
-            ) VALUES (?, ?, ?, 'task', ?, ?, ?)
+            ) VALUES (%s, %s, %s, %s, 'task', %s, %s, %s)
             """,
             (
+                self._user_id,
                 operation_id,
                 fingerprint,
                 change_id,
@@ -536,15 +461,15 @@ class TaskService:
         return response
 
     def changes(self, task_id: str, *, allowed_source_ids: set[str] | None = None) -> list[dict[str, Any]]:
-        with self._lock:
+        with self._people.transaction():
             rows = self._conn.execute(
                 """
                 SELECT *
                 FROM crm_changes
-                WHERE entity_type = 'task' AND entity_id = ?
+                WHERE user_id = %s AND entity_type = 'task' AND entity_id = %s
                 ORDER BY created_at, entity_version
                 """,
-                (task_id,),
+                (self._user_id, task_id),
             ).fetchall()
             result = []
             for row in rows:
@@ -559,14 +484,14 @@ class TaskService:
     # --- writes -------------------------------------------------------------
 
     def create(self, person_id: str, **kwargs: Any) -> dict[str, Any]:
-        with self._lock, self._conn:
-            self._conn.execute("BEGIN IMMEDIATE")
+        with self._people.transaction():
+            self._people.lock_writes()
             response = self._create_uncommitted(person_id, **kwargs)
         return self._project_response(response, kwargs.get("allowed_source_ids"))
 
     def update(self, person_id: str, task_id: str, **kwargs: Any) -> dict[str, Any]:
-        with self._lock, self._conn:
-            self._conn.execute("BEGIN IMMEDIATE")
+        with self._people.transaction():
+            self._people.lock_writes()
             response = self._update_uncommitted(person_id, task_id, **kwargs)
         return self._project_response(response, kwargs.get("allowed_source_ids"))
 
@@ -603,7 +528,7 @@ class TaskService:
             if origin == "human"
             else []
         )
-        with self._lock:
+        with self._people.transaction():
             if not self._conn.in_transaction:
                 raise RuntimeError("task writer requires a caller-owned transaction")
             self._live_person(person_id)
@@ -624,12 +549,13 @@ class TaskService:
             self._conn.execute(
                 """
                 INSERT INTO person_tasks (
-                    task_id, person_id, title, details, due_date,
+                    user_id, task_id, person_id, title, details, due_date,
                     due_timezone, state, origin, protected_fields,
                     source_refs, version, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, 1, ?, ?)
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, 'open', %s, %s, %s, 1, %s, %s)
                 """,
                 (
+                    self._user_id,
                     task_id,
                     person_id,
                     clean["title"],
@@ -721,7 +647,7 @@ class TaskService:
         )
         legacy = _fingerprint({"op": "task.update", "person_id": person_id, "task_id": task_id,
                                "actor": actor, "expected_version": expected_version, "changes": clean}) if not human_requested else None
-        with self._lock:
+        with self._people.transaction():
             if not self._conn.in_transaction:
                 raise RuntimeError("task writer requires a caller-owned transaction")
             self._live_person(person_id)
@@ -807,18 +733,19 @@ class TaskService:
         now: str,
     ) -> dict[str, Any]:
         """Apply column changes as one new version; conflict if the row moved."""
-        assignments = [f"{field} = ?" for field in changed]
+        assignments = [f"{field} = %s" for field in changed]
         cursor = self._conn.execute(
             f"""
             UPDATE person_tasks SET
                 {", ".join(assignments)},
-                protected_fields = ?, version = version + 1, updated_at = ?
-            WHERE task_id = ? AND person_id = ? AND version = ?
+                protected_fields = %s, version = version + 1, updated_at = %s
+            WHERE user_id = %s AND task_id = %s AND person_id = %s AND version = %s
             """,
             (
                 *changed.values(),
                 json.dumps(sorted(protected)),
                 now,
+                self._user_id,
                 task_id,
                 person_id,
                 expected_version,
@@ -872,8 +799,7 @@ class TaskService:
         legacy = _fingerprint({"op": "task.undo", "person_id": person_id, "change_id": change_id,
                                "actor": actor}) if not human_requested and expected_version is None else None
         with self._people.crm_transaction():
-            if not self._conn.in_transaction:
-                self._conn.execute("BEGIN IMMEDIATE")
+            self._people.lock_writes()
             self._live_person(person_id)
             replay = self._replay(operation, fingerprint, legacy_fingerprint=legacy)
             if replay is not None:
@@ -884,9 +810,9 @@ class TaskService:
                 """
                 SELECT entity_id, entity_version, action, before_json
                 FROM crm_changes
-                WHERE change_id = ? AND person_id = ? AND entity_type = 'task'
+                WHERE user_id = %s AND change_id = %s AND person_id = %s AND entity_type = 'task'
                 """,
-                (change_id, person_id),
+                (self._user_id, change_id, person_id),
             ).fetchone()
             if row is None:
                 raise TaskNotFound("unknown change")
@@ -945,5 +871,5 @@ class TaskService:
                 compensates=change_id,
             )
             self._conn.execute("""UPDATE crm_proposals SET state='dismissed', version=version+1,
-                updated_at=? WHERE change_id=? AND state='accepted'""", (now, change_id))
+                updated_at=%s WHERE user_id=%s AND change_id=%s AND state='accepted'""", (now, self._user_id, change_id))
         return self._project_response(response, allowed_source_ids)

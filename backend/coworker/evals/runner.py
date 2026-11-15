@@ -931,15 +931,16 @@ class EvalRunner:
         environment: EvalEnvironment,
         scenario: EvalScenario,
     ) -> tuple[dict[str, Any], list[InvariantResult]]:
-        with environment.people._lock:
+        with environment.people.transaction():
             person_ids = [
                 str(row["person_id"])
                 for row in environment.people._conn.execute(
                     """
                     SELECT person_id FROM people
-                    WHERE deleted_at IS NULL
+                    WHERE user_id = %s AND deleted_at IS NULL
                     ORDER BY person_id
-                    """
+                    """,
+                    (environment.people._user_id,),
                 ).fetchall()
             ]
         people = [

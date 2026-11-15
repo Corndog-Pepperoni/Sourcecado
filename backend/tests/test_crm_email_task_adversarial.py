@@ -120,8 +120,8 @@ def test_legacy_date_reconciliation_without_request_proof_cannot_mutate_task(tmp
     existing = TaskService(people).create(pid, title="Send project proposal", due_date="2026-11-01", actor="director", timezone="America/Los_Angeles", operation_id="legacy-date-proof")["task"]
     service, _ = run(people, pid)
     proposal = service.proposals(pid)[0]
-    with people._conn:
-        people._conn.execute("UPDATE crm_proposals SET proposed_value=? WHERE proposal_id=?", (json.dumps({"changes": {"due_date": "2026-10-23"}}), proposal["proposal_id"]))
+    with people.transaction():
+        people._conn.execute("UPDATE crm_proposals SET proposed_value=%s WHERE user_id = %s AND proposal_id=%s", (json.dumps({"changes": {"due_date": "2026-10-23"}}), people._user_id, proposal["proposal_id"]))
     with pytest.raises(TaskConflict):
         service.resolve(pid, proposal["proposal_id"], action="accept", expected_version=1)
     assert TaskService(people).get(pid, existing["task_id"])["due_date"] == "2026-11-01"
@@ -292,7 +292,7 @@ def test_distinct_request_span_in_unchanged_message_is_not_finished_work(tmp_pat
     proposal = service.proposals(pid)[0]
     assert json.loads(proposal["proposed_value"])["requires_target_review"] is True
     assert TaskService(restarted).get(pid, task["task_id"])["state"] == "completed"
-    evidence = restarted._conn.execute("SELECT message_id, body_fingerprint, request_start FROM crm_task_evidence ORDER BY rowid").fetchall()
+    evidence = restarted._conn.execute("SELECT message_id, body_fingerprint, request_start FROM crm_task_evidence WHERE user_id = %s ORDER BY proposal_id", (restarted._user_id,)).fetchall()
     assert len(evidence) == 2
     assert evidence[0]["message_id"] == evidence[1]["message_id"] == "reply-1"
     assert evidence[0]["body_fingerprint"] == evidence[1]["body_fingerprint"]

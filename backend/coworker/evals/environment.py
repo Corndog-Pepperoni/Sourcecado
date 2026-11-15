@@ -259,4 +259,4 @@ class EvalEnvironment:
         )
 
     def close(self) -> None:
-        self.people._conn.close()
+        """Nothing to close: the stores of this environment are in Postgres."""

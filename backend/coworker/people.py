@@ -1,23 +1,20 @@
-"""Person files — one sqlite db, separate from conversation store."""
+"""Person files: people, timelines, descriptions, attachments and versions."""
 
 from __future__ import annotations
 from contextlib import contextmanager
 
 import json
-import os
 import re
-import sqlite3
-import threading
 import uuid
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any
 
-from coworker.crm_tasks import CRM_TASK_STATEMENTS, TaskConflict, _clean_operation_id, _fingerprint
+from coworker import db
+from coworker.crm_tasks import TaskConflict, _clean_operation_id, _fingerprint
 from coworker.crm_sources import source_ids
-from coworker.crm_analysis_schema import CRM_ANALYSIS_STATEMENTS
-from coworker.crm_email_task_schema import add_task_analysis_schema
+from coworker.people_db import PeopleSql, PeopleTx, Row
 from coworker.person_identity import (
     apollo_surname_is_masked,
     without_apollo_name_masks,
@@ -25,15 +22,6 @@ from coworker.person_identity import (
 
 _SID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 
-# Declared schema version for people.db, read by coworker.migrations.
-# v3 adds the person_descriptions table (ticket #202); v4 adds the person_tasks,
-# crm_changes and crm_operations tables (ticket #200); v5 adds task lifecycle
-# actions (ticket #201); v6 adds durable analysis, proposals and description
-# history (#209); v7 adds canonical task evidence and analysis stage tracking
-# (#210); v9 adds approval identity revisions and v10 protected person corrections
-# (#243). The constructor creates fresh tables. Existing databases use
-# the registered migrations with backup and rollback before the new writer runs.
-SCHEMA_VERSION = 10
 APPROVAL_IDENTITY_FIELDS = ("first_name", "last_name", "company", "email", "apollo_id")
 
 SEQUENCE_STATES = ("open", "in_conversation", "done")
@@ -84,205 +72,54 @@ def _new_event_id() -> str:
     return "evt_" + uuid.uuid4().hex
 
 
-class CrmMigrationRequired(ValueError):
-    """The declared people.db version cannot safely record current CRM writes."""
-
-    code = "crm_migration_required"
-
-    def __init__(self) -> None:
-        super().__init__("CRM migration required: stop Sourcecado and run make doctor-repair before analysis")
-
-
 class PersonStore:
+    """People, person files, tasks and CRM history of one user.
+
+    The tables are in Postgres (supabase/migrations/20261110000400_people.sql).
+    `transaction()` is the one transaction that the CRM modules share; see
+    coworker.people_db.
+    """
+
     def __init__(self, base_dir: str | Path) -> None:
         self.base = Path(base_dir).expanduser()
-        self.base.mkdir(parents=True, exist_ok=True)
-        os.chmod(self.base, 0o700)
-        self.db_path = self.base / "people.db"
-        self._lock = threading.RLock()
-        self._conn = sqlite3.connect(self.db_path, check_same_thread=False)
-        os.chmod(self.db_path, 0o600)
-        self._conn.row_factory = sqlite3.Row
-        # Only an empty, unversioned database is ours to initialize at the
-        # current version. Existing stores still need the backed-up registry
-        # path, even when constructor probes have added missing tables.
-        initial_version = int(self._conn.execute("PRAGMA user_version").fetchone()[0])
-        fresh_database = initial_version == 0 and self._conn.execute(
-            "SELECT 1 FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' LIMIT 1"
-        ).fetchone() is None
-        # SQLite enforces foreign keys per connection. Task and CRM-change rows
-        # reference people(person_id), so a write for a missing person fails
-        # here even if a caller skips the service's own check.
-        self._conn.execute("PRAGMA foreign_keys = ON")
-        self._conn.executescript(
-            """
-            CREATE TABLE IF NOT EXISTS people (
-                person_id TEXT PRIMARY KEY,
-                apollo_id TEXT UNIQUE,
-                first_name TEXT,
-                last_name TEXT,
-                apollo_last_name_obfuscated TEXT,
-                title TEXT,
-                company TEXT,
-                email TEXT,
-                linkedin_url TEXT,
-                phone TEXT,
-                sequence_state TEXT,
-                target TEXT,
-                handoff_who TEXT,
-                handoff_wanted TEXT,
-                handoff_happened TEXT,
-                handoff_they_want TEXT,
-                version INTEGER NOT NULL DEFAULT 1,
-                identity_revision INTEGER NOT NULL DEFAULT 0 CHECK(identity_revision >= 0),
-                outcome TEXT,
-                deleted_at TEXT,
-                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-                updated_at TEXT DEFAULT CURRENT_TIMESTAMP
-            );
-            CREATE TABLE IF NOT EXISTS events (
-                event_id TEXT PRIMARY KEY,
-                person_id TEXT NOT NULL,
-                external_key TEXT,
-                source TEXT NOT NULL,
-                kind TEXT NOT NULL,
-                summary TEXT NOT NULL,
-                payload TEXT NOT NULL DEFAULT '{}',
-                actor TEXT NOT NULL,
-                session_id TEXT,
-                run_id TEXT,
-                tool TEXT,
-                created_at TEXT DEFAULT CURRENT_TIMESTAMP
-            );
-            CREATE TABLE IF NOT EXISTS session_people (
-                session_id TEXT PRIMARY KEY,
-                person_id TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS person_attachments (
-                id TEXT PRIMARY KEY,
-                person_id TEXT NOT NULL,
-                record_type TEXT NOT NULL,
-                idempotency_key TEXT NOT NULL,
-                fields_json TEXT NOT NULL,
-                restricted INTEGER NOT NULL DEFAULT 0,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL,
-                UNIQUE(person_id, record_type, idempotency_key)
-            );
-            CREATE TABLE IF NOT EXISTS person_versions (
-                person_id TEXT NOT NULL,
-                version INTEGER NOT NULL,
-                person_json TEXT NOT NULL,
-                attachments_json TEXT NOT NULL,
-                created_at TEXT NOT NULL,
-                PRIMARY KEY (person_id, version)
-            );
-            CREATE TABLE IF NOT EXISTS reply_sync (
-                id INTEGER PRIMARY KEY CHECK (id = 1),
-                history_id TEXT,
-                updated_at TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS person_descriptions (
-                person_id TEXT NOT NULL,
-                slot TEXT NOT NULL,
-                text TEXT,
-                authority TEXT NOT NULL DEFAULT 'assistant',
-                source_refs TEXT NOT NULL DEFAULT '[]',
-                version INTEGER NOT NULL DEFAULT 0,
-                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-                updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
-                PRIMARY KEY (person_id, slot)
-            );
-            """
-        )
-        self._ensure_schema()
-        from coworker.crm_mail_repository import MAIL_SCHEMA
-        from coworker.crm_unified_schema import additions
-        statements = (*CRM_TASK_STATEMENTS, *MAIL_SCHEMA, *CRM_ANALYSIS_STATEMENTS)
-        if fresh_database:
-            # Canonical analysis owns the table; the historical mail DDL is frozen.
-            statements = (*CRM_TASK_STATEMENTS, *CRM_ANALYSIS_STATEMENTS, *MAIL_SCHEMA)
-        for statement in statements:
-            if not fresh_database and statement.lstrip().startswith("CREATE INDEX"):
-                continue
-            self._conn.execute(statement.replace("'description', 'task_create', 'task_update'", "'description', 'task_create', 'task_update', 'status'"))
-        if fresh_database:
-            add_task_analysis_schema(self._conn)
-            additions(self._conn)
-            from coworker.person_corrections import add_schema
-            add_schema(self._conn)
-            self._conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
-        self._conn.commit()
+        database, self._user_id = db.resolve(self.base)
+        self._scope = PeopleTx(database, self._user_id)
+        self._lock = self._scope.lock
+        self._conn = PeopleSql(self._scope)
+
+    def transaction(self):
+        """Open the store transaction, or join the one this thread has open."""
+        return self._scope.begin()
+
+    def lock_writes(self) -> None:
+        """Hold this user's CRM write lock until the transaction ends.
+
+        SQLite writers took the database write lock with BEGIN IMMEDIATE
+        before they read versions and operation ids. This per-user advisory
+        lock gives the same guarantee: one CRM writer per user at a time.
+        """
+        active = self._scope.current
+        if active is None:
+            raise RuntimeError("lock_writes needs an open transaction")
+        active.lock_user()
 
     @contextmanager
     def crm_transaction(self):
+        """A transaction for one CRM write, holding the user's write lock.
+
+        Nested in an open transaction, it is a savepoint: an error inside it
+        undoes only its own statements.
+        """
         with self._lock:
-            nested = self._conn.in_transaction
-            if nested:
-                self._conn.execute("SAVEPOINT crm_nested")
-            else:
-                self._conn.execute("BEGIN IMMEDIATE")
-            try:
-                yield self._conn
-                self._conn.execute("RELEASE crm_nested") if nested else self._conn.commit()
-            except BaseException:
-                if nested:
-                    self._conn.execute("ROLLBACK TO crm_nested")
-                    self._conn.execute("RELEASE crm_nested")
-                else:
-                    self._conn.rollback()
-                raise
-
-    def _crm_description_history_ready(self) -> bool:
-        version = int(self._conn.execute("PRAGMA user_version").fetchone()[0])
-        schema = self._conn.execute("SELECT sql FROM sqlite_master WHERE name='crm_changes'").fetchone()
-        stages = {row["name"] for row in self._conn.execute("PRAGMA table_info(crm_analysis_state)")}
-        evidence = self._conn.execute("SELECT 1 FROM sqlite_master WHERE name='crm_task_evidence'").fetchone()
-        return (version == SCHEMA_VERSION and schema is not None and "'description'" in schema[0]
-            and "analysis_version" in stages and evidence is not None)
-
-    def require_crm_schema(self) -> None:
-        with self._lock:
-            if not self._crm_description_history_ready():
-                raise CrmMigrationRequired()
-
-    def _ensure_schema(self) -> None:
-        columns = {
-            str(row["name"])
-            for row in self._conn.execute("PRAGMA table_info(people)").fetchall()
-        }
-        if "version" not in columns:
-            self._conn.execute(
-                "ALTER TABLE people ADD COLUMN version INTEGER NOT NULL DEFAULT 1"
-            )
-        if "outcome" not in columns:
-            self._conn.execute("ALTER TABLE people ADD COLUMN outcome TEXT")
-        if "deleted_at" not in columns:
-            self._conn.execute("ALTER TABLE people ADD COLUMN deleted_at TEXT")
-        if "apollo_last_name_obfuscated" not in columns:
-            self._conn.execute(
-                "ALTER TABLE people ADD COLUMN apollo_last_name_obfuscated TEXT"
-            )
-        self._conn.execute(
-            """
-            UPDATE people SET
-                apollo_last_name_obfuscated = last_name,
-                last_name = NULL
-            WHERE last_name LIKE '%*%'
-            """
-        )
-        event_columns = {
-            str(row["name"])
-            for row in self._conn.execute("PRAGMA table_info(events)").fetchall()
-        }
-        if "external_key" not in event_columns:
-            self._conn.execute("ALTER TABLE events ADD COLUMN external_key TEXT")
-        self._conn.execute(
-            """
-            CREATE UNIQUE INDEX IF NOT EXISTS events_person_external_key
-            ON events(person_id, external_key)
-            """
-        )
+            active = self._scope.current
+            if active is not None:
+                active.lock_user()
+                with active.savepoint() as tx:
+                    yield tx
+                return
+            with self.transaction() as tx:
+                tx.lock_user()
+                yield tx
 
     def _now(self) -> str:
         return datetime.now(UTC).isoformat()
@@ -290,7 +127,7 @@ class PersonStore:
     def _new_attachment_id(self, record_type: str) -> str:
         return f"{record_type}_{uuid.uuid4().hex}"
 
-    def _person_dict(self, row: sqlite3.Row | None) -> dict[str, Any] | None:
+    def _person_dict(self, row: Row | None) -> dict[str, Any] | None:
         if row is None:
             return None
         person = dict(row)
@@ -335,11 +172,11 @@ class PersonStore:
                          for field in APPROVAL_IDENTITY_FIELDS)
         revision = int(current["identity_revision"])
         if facts(old) != facts(current) and revision == int(old.get("identity_revision") or 0):
-            self._conn.execute("UPDATE people SET identity_revision=identity_revision+1 WHERE person_id=?", (person_id,))
+            self._conn.execute("UPDATE people SET identity_revision=identity_revision+1 WHERE user_id=%s AND person_id=%s", (self._user_id, person_id))
             revision += 1
         return revision
 
-    def _attachment_dict(self, row: sqlite3.Row) -> dict[str, Any]:
+    def _attachment_dict(self, row: Row) -> dict[str, Any]:
         return {
             "id": str(row["id"]),
             "person_id": str(row["person_id"]),
@@ -362,7 +199,7 @@ class PersonStore:
             "version": 0,
         }
 
-    def _description_dict(self, row: sqlite3.Row) -> dict[str, Any]:
+    def _description_dict(self, row: Row) -> dict[str, Any]:
         return {
             "slot": str(row["slot"]),
             "text": row["text"],
@@ -373,8 +210,8 @@ class PersonStore:
 
     def _descriptions(self, person_id: str) -> dict[str, dict[str, Any]]:
         rows = self._conn.execute(
-            "SELECT * FROM person_descriptions WHERE person_id = ?",
-            (person_id,),
+            "SELECT * FROM person_descriptions WHERE user_id = %s AND person_id = %s",
+            (self._user_id, person_id),
         ).fetchall()
         found = {str(row["slot"]): self._description_dict(row) for row in rows}
         return {
@@ -388,7 +225,7 @@ class PersonStore:
         Always returns every slot in `DESCRIPTION_SLOTS` so callers never have
         to distinguish "no row" from "slot does not exist".
         """
-        with self._lock:
+        with self.transaction():
             return self._descriptions(person_id)
 
     def _require_audit(self, actor: str, rationale_summary: str) -> None:
@@ -399,10 +236,10 @@ class PersonStore:
 
     def _load_person_row(
         self, person_id: str, *, include_deleted: bool = False
-    ) -> sqlite3.Row:
+    ) -> Row:
         row = self._conn.execute(
-            "SELECT * FROM people WHERE person_id = ?",
-            (person_id,),
+            "SELECT * FROM people WHERE user_id = %s AND person_id = %s",
+            (self._user_id, person_id),
         ).fetchone()
         if row is None:
             raise ValueError("unknown person")
@@ -420,10 +257,10 @@ class PersonStore:
         rows = self._conn.execute(
             """
             SELECT * FROM person_attachments
-            WHERE person_id = ?
+            WHERE user_id = %s AND person_id = %s
             ORDER BY created_at, id
             """,
-            (person_id,),
+            (self._user_id, person_id),
         ).fetchall()
         records: list[dict[str, Any]] = []
         for row in rows:
@@ -436,7 +273,8 @@ class PersonStore:
     def _snapshot(self, person_id: str, version: int, created_at: str) -> None:
         person = self._person_dict(
             self._conn.execute(
-                "SELECT * FROM people WHERE person_id = ?", (person_id,)
+                "SELECT * FROM people WHERE user_id = %s AND person_id = %s",
+                (self._user_id, person_id),
             ).fetchone()
         )
         if person is not None:
@@ -448,17 +286,22 @@ class PersonStore:
         attachments = [
             self._attachment_dict(row)
             for row in self._conn.execute(
-                "SELECT * FROM person_attachments WHERE person_id = ? ORDER BY id",
-                (person_id,),
+                "SELECT * FROM person_attachments WHERE user_id = %s AND person_id = %s ORDER BY id",
+                (self._user_id, person_id),
             ).fetchall()
         ]
         self._conn.execute(
             """
-            INSERT OR REPLACE INTO person_versions (
-                person_id, version, person_json, attachments_json, created_at
-            ) VALUES (?, ?, ?, ?, ?)
+            INSERT INTO person_versions (
+                user_id, person_id, version, person_json, attachments_json, created_at
+            ) VALUES (%s, %s, %s, %s, %s, %s)
+            ON CONFLICT (user_id, person_id, version) DO UPDATE SET
+                person_json = excluded.person_json,
+                attachments_json = excluded.attachments_json,
+                created_at = excluded.created_at
             """,
             (
+                self._user_id,
                 person_id,
                 version,
                 json.dumps(person, sort_keys=True),
@@ -480,7 +323,8 @@ class PersonStore:
         """
         previous = self._descriptions(person_id)
         self._conn.execute(
-            "DELETE FROM person_descriptions WHERE person_id = ?", (person_id,)
+            "DELETE FROM person_descriptions WHERE user_id = %s AND person_id = %s",
+            (self._user_id, person_id),
         )
         for slot in DESCRIPTION_SLOTS:
             entry = captured.get(slot)
@@ -502,11 +346,12 @@ class PersonStore:
             self._conn.execute(
                 """
                 INSERT INTO person_descriptions (
-                    person_id, slot, text, authority, source_refs, version,
+                    user_id, person_id, slot, text, authority, source_refs, version,
                     created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """,
                 (
+                    self._user_id,
                     person_id,
                     slot,
                     text,
@@ -533,11 +378,12 @@ class PersonStore:
         self._conn.execute(
             """
             INSERT INTO events (
-                event_id, person_id, source, kind, summary, payload,
+                user_id, event_id, person_id, source, kind, summary, payload,
                 actor, session_id, run_id, tool
-            ) VALUES (?, ?, 'sourcecado', ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (%s, %s, %s, 'sourcecado', %s, %s, %s, %s, %s, %s, %s)
             """,
             (
+                self._user_id,
                 _new_event_id(),
                 person_id,
                 kind,
@@ -593,12 +439,12 @@ class PersonStore:
         title = _clean(title)
         company = _clean(company)
         cleaned_target = _clean(target)
-        with self._lock:
+        with self.transaction():
             existing = None
             if apollo is not None:
                 existing = self._conn.execute(
-                    "SELECT * FROM people WHERE apollo_id = ?",
-                    (apollo,),
+                    "SELECT * FROM people WHERE user_id = %s AND apollo_id = %s",
+                    (self._user_id, apollo),
                 ).fetchone()
             if existing is not None:
                 incoming,_conflicts=self._filter_provider_fields(existing['person_id'],{'first_name':first_name,'last_name':incoming_last_name,'title':title,'company':company})
@@ -630,16 +476,16 @@ class PersonStore:
                 self._conn.execute(
                     """
                     UPDATE people SET
-                        first_name = COALESCE(?, first_name),
-                        last_name = ?,
-                        apollo_last_name_obfuscated = ?,
-                        title = COALESCE(?, title),
-                        company = COALESCE(?, company),
-                        target = COALESCE(?, target),
+                        first_name = COALESCE(%s, first_name),
+                        last_name = %s,
+                        apollo_last_name_obfuscated = %s,
+                        title = COALESCE(%s, title),
+                        company = COALESCE(%s, company),
+                        target = COALESCE(%s, target),
                         deleted_at = NULL,
-                        version = ?,
-                        updated_at = ?
-                    WHERE person_id = ?
+                        version = %s,
+                        updated_at = %s
+                    WHERE user_id = %s AND person_id = %s
                     """,
                     (
                         first_name,
@@ -650,6 +496,7 @@ class PersonStore:
                         cleaned_target,
                         next_version,
                         now,
+                        self._user_id,
                         existing["person_id"],
                     ),
                 )
@@ -667,21 +514,21 @@ class PersonStore:
                         run_id=None,
                         tool="people_keep",
                     )
-                self._conn.commit()
                 row = self._conn.execute(
-                    "SELECT * FROM people WHERE person_id = ?",
-                    (existing["person_id"],),
+                    "SELECT * FROM people WHERE user_id = %s AND person_id = %s",
+                    (self._user_id, existing["person_id"]),
                 ).fetchone()
             else:
                 pid = _new_person_id()
                 self._conn.execute(
                     """
                     INSERT INTO people (
-                        person_id, apollo_id, first_name, last_name,
+                        user_id, person_id, apollo_id, first_name, last_name,
                         apollo_last_name_obfuscated, title, company, target
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
                     """,
                     (
+                        self._user_id,
                         pid,
                         apollo,
                         first_name,
@@ -692,24 +539,22 @@ class PersonStore:
                         cleaned_target,
                     ),
                 )
-                self._conn.commit()
                 row = self._conn.execute(
-                    "SELECT * FROM people WHERE person_id = ?",
-                    (pid,),
+                    "SELECT * FROM people WHERE user_id = %s AND person_id = %s",
+                    (self._user_id, pid),
                 ).fetchone()
             person = self._person_dict(row)
             assert person is not None
             self._snapshot(person["person_id"], int(person["version"]), self._now())
-            self._conn.commit()
         person = self._person_dict(row)
         assert person is not None
         return person
 
     def get_by_apollo_id(self, apollo_id: str) -> dict[str, Any] | None:
-        with self._lock:
+        with self.transaction():
             row = self._conn.execute(
-                "SELECT * FROM people WHERE apollo_id = ? AND deleted_at IS NULL",
-                (apollo_id,),
+                "SELECT * FROM people WHERE user_id = %s AND apollo_id = %s AND deleted_at IS NULL",
+                (self._user_id, apollo_id),
             ).fetchone()
         return self._person_dict(row)
 
@@ -742,10 +587,10 @@ class PersonStore:
             last_name = parts[1] if len(parts) > 1 else None
             if apollo_surname_is_masked(last_name):
                 last_name = None
-        with self._lock:
+        with self.transaction():
             exists = self._conn.execute(
-                "SELECT * FROM people WHERE person_id = ?",
-                (person_id,),
+                "SELECT * FROM people WHERE user_id = %s AND person_id = %s",
+                (self._user_id, person_id),
             ).fetchone()
             if exists is None:
                 return None
@@ -754,15 +599,15 @@ class PersonStore:
             self._conn.execute(
                 """
                 UPDATE people SET
-                    first_name = COALESCE(?, first_name),
-                    last_name = COALESCE(?, last_name),
-                    title = COALESCE(?, title),
-                    company = COALESCE(?, company),
-                    email = COALESCE(?, email),
-                    linkedin_url = COALESCE(?, linkedin_url),
-                    phone = COALESCE(?, phone),
-                    updated_at = CURRENT_TIMESTAMP
-                WHERE person_id = ?
+                    first_name = COALESCE(%s, first_name),
+                    last_name = COALESCE(%s, last_name),
+                    title = COALESCE(%s, title),
+                    company = COALESCE(%s, company),
+                    email = COALESCE(%s, email),
+                    linkedin_url = COALESCE(%s, linkedin_url),
+                    phone = COALESCE(%s, phone),
+                    updated_at = people_timestamp()
+                WHERE user_id = %s AND person_id = %s
                 """,
                 (
                     first_name,
@@ -772,6 +617,7 @@ class PersonStore:
                     email,
                     linkedin_url,
                     phone,
+                    self._user_id,
                     person_id,
                 ),
             )
@@ -863,9 +709,9 @@ class PersonStore:
             session_id=session_id,
             run_id=run_id,
         )
-        with self._lock:
+        with self.transaction():
             for item in conflicts:
-                self._conn.execute('UPDATE person_correction_conflicts SET source_ref_id=? WHERE conflict_id=?',(source['id'],item['conflict_id']))
+                self._conn.execute('UPDATE person_correction_conflicts SET source_ref_id=%s WHERE user_id=%s AND conflict_id=%s',(source['id'],self._user_id,item['conflict_id']))
                 item['source_ref_id']=source['id']
             self._receipt(
                 person_id,
@@ -895,12 +741,12 @@ class PersonStore:
 
     def get_apollo_enrichment_receipt(self,person_id,approval_id):
         """The filed receipt for one approved lookup, or None before it is filed."""
-        with self._lock:
-            rows=self._conn.execute("SELECT payload FROM events WHERE person_id=? AND kind='enrich' AND tool='apollo_enrich_contact'",(person_id,)).fetchall()
+        with self.transaction():
+            rows=self._conn.execute("SELECT payload FROM events WHERE user_id=%s AND person_id=%s AND kind='enrich' AND tool='apollo_enrich_contact'",(self._user_id,person_id)).fetchall()
         payload=next((data for data in (json.loads(row[0] or "{}") for row in rows) if data.get("approval_id")==approval_id),None)
         if payload is None:
             return None
-        with self._lock:
+        with self.transaction():
             source=next((item for item in self._attachments_for(person_id) if item["id"]==payload.get("source_ref_id")),None)
         if source is None:
             return None
@@ -954,21 +800,22 @@ class PersonStore:
         if task_id:
             # Recorded only. Sending does not complete the task.
             payload["task_id"] = task_id
-        with self._lock:
+        with self.transaction():
             row = self._load_person_row(person_id)
             already = self._conn.execute(
-                "SELECT event_id, kind, payload FROM events WHERE person_id = ? AND external_key = ?",
-                (person_id, external_key),
+                "SELECT event_id, kind, payload FROM events WHERE user_id = %s AND person_id = %s AND external_key = %s",
+                (self._user_id, person_id, external_key),
             ).fetchone()
             if already is None:
                 self._conn.execute(
                     """
                     INSERT INTO events (
-                        event_id, person_id, external_key, source, kind, summary,
+                        user_id, event_id, person_id, external_key, source, kind, summary,
                         payload, actor, session_id, run_id, tool
-                    ) VALUES (?, ?, ?, 'gmail', 'send', ?, ?, ?, ?, ?, 'gmail_send')
+                    ) VALUES (%s, %s, %s, %s, 'gmail', 'send', %s, %s, %s, %s, %s, 'gmail_send')
                     """,
                     (
+                        self._user_id,
                         _new_event_id(),
                         person_id,
                         external_key,
@@ -980,10 +827,9 @@ class PersonStore:
                     ),
                 )
                 self._conn.execute(
-                    "UPDATE people SET updated_at = ? WHERE person_id = ?",
-                    (self._now(), person_id),
+                    "UPDATE people SET updated_at = %s WHERE user_id = %s AND person_id = %s",
+                    (self._now(), self._user_id, person_id),
                 )
-                self._conn.commit()
             elif already["kind"] == "mail":
                 collected = json.loads(already["payload"])
                 if collected.get("direction") != "outbound":
@@ -991,15 +837,14 @@ class PersonStore:
                 # Collection is read-only evidence, never a send approval. If
                 # the sanctioned send path later files its receipt, preserve
                 # that authority on the same event rather than losing it.
-                self._conn.execute("""UPDATE events SET kind = 'send', summary = ?, payload = ?,
-                    actor = ?, session_id = ?, run_id = ?, tool = 'gmail_send' WHERE event_id = ?""",
+                self._conn.execute("""UPDATE events SET kind = 'send', summary = %s, payload = %s,
+                    actor = %s, session_id = %s, run_id = %s, tool = 'gmail_send' WHERE user_id = %s AND event_id = %s""",
                     (f"Sent approved outreach to {to}", json.dumps({**collected, **payload}),
-                     actor, session_id, run_id, already["event_id"]))
-                self._conn.commit()
+                     actor, session_id, run_id, self._user_id, already["event_id"]))
             event = self._event_dict(
                 self._conn.execute(
-                    "SELECT * FROM events WHERE person_id = ? AND external_key = ?",
-                    (person_id, external_key),
+                    "SELECT * FROM events WHERE user_id = %s AND person_id = %s AND external_key = %s",
+                    (self._user_id, person_id, external_key),
                 ).fetchone()
             )
             needs_open = row["sequence_state"] not in SEQUENCE_STATES
@@ -1022,9 +867,10 @@ class PersonStore:
 
     def reply_cursor(self) -> str | None:
         """The Gmail history id the last completed reply sync reached."""
-        with self._lock:
+        with self.transaction():
             row = self._conn.execute(
-                "SELECT history_id FROM reply_sync WHERE id = 1"
+                "SELECT history_id FROM reply_sync WHERE user_id = %s AND id = 1",
+                (self._user_id,),
             ).fetchone()
         if row is None:
             return None
@@ -1032,40 +878,39 @@ class PersonStore:
 
     def set_reply_cursor(self, history_id: str | None) -> None:
         """Move the incremental boundary, or clear it to force a re-baseline."""
-        with self._lock:
+        with self.transaction():
             self._conn.execute(
                 """
-                INSERT INTO reply_sync (id, history_id, updated_at)
-                VALUES (1, ?, ?)
-                ON CONFLICT(id) DO UPDATE SET
+                INSERT INTO reply_sync (user_id, id, history_id, updated_at)
+                VALUES (%s, 1, %s, %s)
+                ON CONFLICT (user_id, id) DO UPDATE SET
                     history_id = excluded.history_id,
                     updated_at = excluded.updated_at
                 """,
-                (history_id, self._now()),
+                (self._user_id, history_id, self._now()),
             )
-            self._conn.commit()
 
     def _has_external_event(self, person_id: str, external_key: str) -> bool:
-        with self._lock:
+        with self.transaction():
             row = self._conn.execute(
                 """
                 SELECT 1 FROM events
-                WHERE person_id = ? AND external_key = ?
+                WHERE user_id = %s AND person_id = %s AND external_key = %s
                 """,
-                (person_id, external_key),
+                (self._user_id, person_id, external_key),
             ).fetchone()
         return row is not None
 
     def _has_attachment(
         self, person_id: str, record_type: str, idempotency_key: str
     ) -> bool:
-        with self._lock:
+        with self.transaction():
             row = self._conn.execute(
                 """
                 SELECT 1 FROM person_attachments
-                WHERE person_id = ? AND record_type = ? AND idempotency_key = ?
+                WHERE user_id = %s AND person_id = %s AND record_type = %s AND idempotency_key = %s
                 """,
-                (person_id, record_type, idempotency_key),
+                (self._user_id, person_id, record_type, idempotency_key),
             ).fetchone()
         return row is not None
 
@@ -1148,7 +993,7 @@ class PersonStore:
             actor=actor,
             tool="gmail_read",
         )
-        with self._lock:
+        with self.transaction():
             row = self._load_person_row(person_id)
             advance = str(row["sequence_state"] or "") == "open"
         if advance and self._already_transitioned_for(person_id, message_id):
@@ -1210,37 +1055,39 @@ class PersonStore:
         with self.crm_transaction() as conn:
             row = self._load_person_row(person_id)
             prior = conn.execute("""SELECT * FROM person_attachments
-                WHERE person_id = ? AND record_type = 'knowledge_gap' AND idempotency_key = ?""",
-                (person_id, idempotency_key)).fetchone()
+                WHERE user_id = %s AND person_id = %s AND record_type = 'knowledge_gap' AND idempotency_key = %s""",
+                (self._user_id, person_id, idempotency_key)).fetchone()
             if prior and json.loads(prior["fields_json"]) == fields:
                 return {"gap": self._attachment_dict(prior), "already_recorded": True}
             now = self._now()
             record_id = prior["id"] if prior else self._new_attachment_id("knowledge_gap")
             if prior:
-                conn.execute("UPDATE person_attachments SET fields_json = ?, updated_at = ? WHERE id = ?",
-                    (json.dumps(fields, sort_keys=True), now, record_id))
+                conn.execute("UPDATE person_attachments SET fields_json = %s, updated_at = %s WHERE user_id = %s AND id = %s",
+                    (json.dumps(fields, sort_keys=True), now, self._user_id, record_id))
             else:
                 conn.execute("""INSERT INTO person_attachments
-                    (id, person_id, record_type, idempotency_key, fields_json, restricted, created_at, updated_at)
-                    VALUES (?, ?, 'knowledge_gap', ?, ?, 0, ?, ?)""",
-                    (record_id, person_id, idempotency_key, json.dumps(fields, sort_keys=True), now, now))
+                    (user_id, id, person_id, record_type, idempotency_key, fields_json, restricted, created_at, updated_at)
+                    VALUES (%s, %s, %s, 'knowledge_gap', %s, %s, 0, %s, %s)""",
+                    (self._user_id, record_id, person_id, idempotency_key, json.dumps(fields, sort_keys=True), now, now))
             version = int(row["version"]) + 1
-            conn.execute("UPDATE people SET version = ?, updated_at = ? WHERE person_id = ?", (version, now, person_id))
+            conn.execute("UPDATE people SET version = %s, updated_at = %s WHERE user_id = %s AND person_id = %s", (version, now, self._user_id, person_id))
             self._receipt(person_id, kind="reply_gap_updated" if prior else "knowledge_gap",
                 summary="Gmail message could not be tied to one person.",
                 payload={"id": record_id, "message_id": message_id, "reason": reason, "version": version},
                 actor=actor, session_id=None, run_id=None)
             self._snapshot(person_id, version, now)
-            stored = conn.execute("SELECT * FROM person_attachments WHERE id = ?", (record_id,)).fetchone()
+            stored = conn.execute("SELECT * FROM person_attachments WHERE user_id = %s AND id = %s", (self._user_id, record_id)).fetchone()
             return {"gap": self._attachment_dict(stored), "already_recorded": False}
 
 
     def resolve_reply_gaps(self, *, message_id: str) -> None:
         """Resolve this message's warnings on all earlier candidates, retaining audit."""
         with self.crm_transaction() as conn:
-            gaps = conn.execute("""SELECT a.* FROM person_attachments a JOIN people p ON p.person_id = a.person_id
-                WHERE a.record_type = 'knowledge_gap' AND a.idempotency_key = ? AND p.deleted_at IS NULL""",
-                (f"gmail:reply:{message_id}",)).fetchall()
+            gaps = conn.execute("""SELECT a.* FROM person_attachments a
+                JOIN people p ON p.user_id = a.user_id AND p.person_id = a.person_id
+                WHERE a.user_id = %s AND a.record_type = 'knowledge_gap' AND a.idempotency_key = %s
+                AND p.deleted_at IS NULL""",
+                (self._user_id, f"gmail:reply:{message_id}")).fetchall()
             for gap in gaps:
                 fields = json.loads(gap["fields_json"])
                 if fields.get("resolved") or fields.get("kind") != "unassigned_reply":
@@ -1248,11 +1095,11 @@ class PersonStore:
                 person_id = gap["person_id"]
                 now = self._now()
                 fields.update({"resolved": True, "resolved_at": now})
-                conn.execute("UPDATE person_attachments SET fields_json = ?, updated_at = ? WHERE id = ?",
-                    (json.dumps(fields, sort_keys=True), now, gap["id"]))
+                conn.execute("UPDATE person_attachments SET fields_json = %s, updated_at = %s WHERE user_id = %s AND id = %s",
+                    (json.dumps(fields, sort_keys=True), now, self._user_id, gap["id"]))
                 row = self._load_person_row(person_id)
                 version = int(row["version"]) + 1
-                conn.execute("UPDATE people SET version = ?, updated_at = ? WHERE person_id = ?", (version, now, person_id))
+                conn.execute("UPDATE people SET version = %s, updated_at = %s WHERE user_id = %s AND person_id = %s", (version, now, self._user_id, person_id))
                 self._receipt(person_id, kind="reply_gap_resolved", summary="Matched previously unassigned Gmail message.",
                     payload={"id": gap["id"], "message_id": message_id, "version": version}, actor="assistant",
                     session_id=None, run_id=None)
@@ -1342,13 +1189,13 @@ class PersonStore:
                 for item in mail)
             if not answered:
                 unanswered.append(reply[4].get("message_id"))
-        with self._lock:
+        with self.transaction():
             rows = self._conn.execute(
                 """
                 SELECT fields_json FROM person_attachments
-                WHERE person_id = ? AND record_type = 'knowledge_gap'
+                WHERE user_id = %s AND person_id = %s AND record_type = 'knowledge_gap'
                 """,
-                (person_id,),
+                (self._user_id, person_id),
             ).fetchall()
         gaps = [json.loads(str(row["fields_json"])) for row in rows]
         needs_review = any(gap.get("kind") == "unassigned_reply" and not gap.get("resolved") for gap in gaps)
@@ -1375,10 +1222,10 @@ class PersonStore:
         expand_sources: bool = False,
         allowed_source_ids: set[str] | None = None,
     ) -> dict[str, Any] | None:
-        with self._lock:
+        with self.transaction():
             row = self._conn.execute(
-                "SELECT * FROM people WHERE person_id = ? AND deleted_at IS NULL",
-                (person_id,),
+                "SELECT * FROM people WHERE user_id = %s AND person_id = %s AND deleted_at IS NULL",
+                (self._user_id, person_id),
             ).fetchone()
             person = self._person_dict(row)
             if person is None or not expand_sources:
@@ -1389,9 +1236,9 @@ class PersonStore:
             restricted_hidden = self._conn.execute(
                 """
                 SELECT COUNT(*) FROM person_attachments
-                WHERE person_id = ? AND restricted = 1
+                WHERE user_id = %s AND person_id = %s AND restricted = 1
                 """,
-                (person_id,),
+                (self._user_id, person_id),
             ).fetchone()[0]
         person["attachments"] = attachments
         person["sources"] = [
@@ -1420,7 +1267,7 @@ class PersonStore:
         rationale_summary: str = "",
         source_ref: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        with self._lock:
+        with self.transaction():
             self._write_sequence(
                 person_id,
                 state,
@@ -1431,10 +1278,9 @@ class PersonStore:
                 rationale_summary=rationale_summary,
                 source_ref=source_ref,
             )
-            self._conn.commit()
             row = self._conn.execute(
-                "SELECT * FROM people WHERE person_id = ?",
-                (person_id,),
+                "SELECT * FROM people WHERE user_id = %s AND person_id = %s",
+                (self._user_id, person_id),
             ).fetchone()
         person = self._person_dict(row)
         assert person is not None
@@ -1482,10 +1328,10 @@ class PersonStore:
         self._conn.execute(
             """
             UPDATE people
-            SET sequence_state = ?, outcome = ?, version = ?, updated_at = ?
-            WHERE person_id = ?
+            SET sequence_state = %s, outcome = %s, version = %s, updated_at = %s
+            WHERE user_id = %s AND person_id = %s
             """,
-            (state, next_outcome, next_version, now, person_id),
+            (state, next_outcome, next_version, now, self._user_id, person_id),
         )
         self._receipt(
             person_id,
@@ -1509,16 +1355,18 @@ class PersonStore:
 
     def list_board(self) -> dict[str, list[dict[str, Any]]]:
         board: dict[str, list[dict[str, Any]]] = {lane: [] for lane in BOARD_LANES}
-        with self._lock:
+        with self.transaction():
             rows = self._conn.execute(
                 """
                 SELECT * FROM people
-                WHERE deleted_at IS NULL
+                WHERE user_id = %s AND deleted_at IS NULL
                 ORDER BY updated_at DESC, person_id
-                """
+                """,
+                (self._user_id,),
             ).fetchall()
             description_rows = self._conn.execute(
-                "SELECT * FROM person_descriptions"
+                "SELECT * FROM person_descriptions WHERE user_id = %s",
+                (self._user_id,),
             ).fetchall()
         descriptions_by_person: dict[str, dict[str, dict[str, Any]]] = {}
         for description_row in description_rows:
@@ -1547,17 +1395,18 @@ class PersonStore:
         return board
 
     def list_people(self) -> list[dict[str, Any]]:
-        with self._lock:
+        with self.transaction():
             rows = self._conn.execute(
                 """
                 SELECT * FROM people
-                WHERE deleted_at IS NULL
+                WHERE user_id = %s AND deleted_at IS NULL
                 ORDER BY person_id
-                """
+                """,
+                (self._user_id,),
             ).fetchall()
         return [person for row in rows if (person := self._person_dict(row))]
 
-    def _event_dict(self, row: sqlite3.Row) -> dict[str, Any]:
+    def _event_dict(self, row: Row) -> dict[str, Any]:
         item = dict(row)
         raw = item.get("payload") or "{}"
         item["payload"] = json.loads(raw) if isinstance(raw, str) else raw
@@ -1582,10 +1431,10 @@ class PersonStore:
             raise ValueError(f"invalid actor {actor}")
         if not summary.strip():
             raise ValueError("summary is required")
-        with self._lock:
+        with self.transaction():
             exists = self._conn.execute(
-                "SELECT 1 FROM people WHERE person_id = ? AND deleted_at IS NULL",
-                (person_id,),
+                "SELECT 1 FROM people WHERE user_id = %s AND person_id = %s AND deleted_at IS NULL",
+                (self._user_id, person_id),
             ).fetchone()
             if exists is None:
                 raise ValueError("unknown person")
@@ -1593,11 +1442,12 @@ class PersonStore:
             self._conn.execute(
                 """
                 INSERT INTO events (
-                    event_id, person_id, source, kind, summary, payload,
+                    user_id, event_id, person_id, source, kind, summary, payload,
                     actor, session_id, run_id, tool
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """,
                 (
+                    self._user_id,
                     event_id,
                     person_id,
                     source,
@@ -1611,13 +1461,12 @@ class PersonStore:
                 ),
             )
             self._conn.execute(
-                "UPDATE people SET updated_at = CURRENT_TIMESTAMP WHERE person_id = ?",
-                (person_id,),
+                "UPDATE people SET updated_at = people_timestamp() WHERE user_id = %s AND person_id = %s",
+                (self._user_id, person_id),
             )
-            self._conn.commit()
             row = self._conn.execute(
-                "SELECT * FROM events WHERE event_id = ?",
-                (event_id,),
+                "SELECT * FROM events WHERE user_id = %s AND event_id = %s",
+                (self._user_id, event_id),
             ).fetchone()
         return self._event_dict(row)
 
@@ -1642,25 +1491,26 @@ class PersonStore:
             raise ValueError(f"invalid actor {actor}")
         if not summary.strip():
             raise ValueError("summary is required")
-        with self._lock:
+        with self.transaction():
             self._load_person_row(person_id)
             existing = self._conn.execute(
                 """
                 SELECT event_id FROM events
-                WHERE person_id = ? AND external_key = ?
+                WHERE user_id = %s AND person_id = %s AND external_key = %s
                 """,
-                (person_id, key),
+                (self._user_id, person_id, key),
             ).fetchone()
             if existing is None:
                 event_id = _new_event_id()
                 self._conn.execute(
                     """
                     INSERT INTO events (
-                        event_id, person_id, external_key, source, kind, summary,
+                        user_id, event_id, person_id, external_key, source, kind, summary,
                         payload, actor, session_id, run_id, tool
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?)
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, NULL, NULL, %s)
                     """,
                     (
+                        self._user_id,
                         event_id,
                         person_id,
                         key,
@@ -1677,9 +1527,9 @@ class PersonStore:
                 self._conn.execute(
                     """
                     UPDATE events SET
-                        source = ?, kind = ?, summary = ?, payload = ?,
-                        actor = ?, tool = ?
-                    WHERE event_id = ?
+                        source = %s, kind = %s, summary = %s, payload = %s,
+                        actor = %s, tool = %s
+                    WHERE user_id = %s AND event_id = %s
                     """,
                     (
                         source,
@@ -1688,28 +1538,28 @@ class PersonStore:
                         json.dumps(payload or {}),
                         actor,
                         tool,
+                        self._user_id,
                         event_id,
                     ),
                 )
             self._conn.execute(
-                "UPDATE people SET updated_at = CURRENT_TIMESTAMP WHERE person_id = ?",
-                (person_id,),
+                "UPDATE people SET updated_at = people_timestamp() WHERE user_id = %s AND person_id = %s",
+                (self._user_id, person_id),
             )
-            self._conn.commit()
             row = self._conn.execute(
-                "SELECT * FROM events WHERE event_id = ?", (event_id,)
+                "SELECT * FROM events WHERE user_id = %s AND event_id = %s", (self._user_id, event_id)
             ).fetchone()
         return self._event_dict(row)
 
     def timeline(self, person_id: str) -> list[dict[str, Any]]:
-        with self._lock:
+        with self.transaction():
             rows = self._conn.execute(
                 """
                 SELECT * FROM events
-                WHERE person_id = ?
-                ORDER BY rowid ASC
+                WHERE user_id = %s AND person_id = %s
+                ORDER BY seq ASC
                 """,
-                (person_id,),
+                (self._user_id, person_id),
             ).fetchall()
         return [self._event_dict(row) for row in rows]
 
@@ -1723,10 +1573,10 @@ class PersonStore:
         sid = (session_id or "").strip()
         if not sid or not _SID_RE.fullmatch(sid) or ".." in sid:
             raise ValueError("invalid session id")
-        with self._lock:
+        with self.transaction():
             exists = self._conn.execute(
-                "SELECT version FROM people WHERE person_id = ? AND deleted_at IS NULL",
-                (person_id,),
+                "SELECT version FROM people WHERE user_id = %s AND person_id = %s AND deleted_at IS NULL",
+                (self._user_id, person_id),
             ).fetchone()
             if exists is None:
                 raise ValueError("unknown person")
@@ -1740,40 +1590,39 @@ class PersonStore:
                     f"expected {expected_person_version}, current {current_version}"
                 )
             bound = self._conn.execute(
-                "SELECT person_id FROM session_people WHERE session_id = ?",
-                (sid,),
+                "SELECT person_id FROM session_people WHERE user_id = %s AND session_id = %s",
+                (self._user_id, sid),
             ).fetchone()
             if bound is not None:
                 if str(bound["person_id"]) != person_id:
                     raise ValueError("session is already bound to another person")
                 return
             person_session = self._conn.execute(
-                "SELECT session_id FROM session_people WHERE person_id = ?",
-                (person_id,),
+                "SELECT session_id FROM session_people WHERE user_id = %s AND person_id = %s",
+                (self._user_id, person_id),
             ).fetchone()
             if person_session is not None:
                 raise ValueError("person already has a bound sourcing session")
             self._conn.execute(
-                "INSERT INTO session_people (session_id, person_id) VALUES (?, ?)",
-                (sid, person_id),
+                "INSERT INTO session_people (user_id, session_id, person_id) VALUES (%s, %s, %s)",
+                (self._user_id, sid, person_id),
             )
-            self._conn.commit()
 
     def person_for_session(self, session_id: str) -> str | None:
-        with self._lock:
+        with self.transaction():
             row = self._conn.execute(
-                "SELECT person_id FROM session_people WHERE session_id = ?",
-                (session_id,),
+                "SELECT person_id FROM session_people WHERE user_id = %s AND session_id = %s",
+                (self._user_id, session_id),
             ).fetchone()
         if row is None:
             return None
         return str(row["person_id"])
 
     def session_for_person(self, person_id: str) -> str | None:
-        with self._lock:
+        with self.transaction():
             rows = self._conn.execute(
-                "SELECT session_id FROM session_people WHERE person_id = ?",
-                (person_id,),
+                "SELECT session_id FROM session_people WHERE user_id = %s AND person_id = %s",
+                (self._user_id, person_id),
             ).fetchall()
         if not rows:
             return None
@@ -1790,29 +1639,28 @@ class PersonStore:
         happened: str,
         they_want: str,
     ) -> dict[str, Any]:
-        with self._lock:
+        with self.transaction():
             exists = self._conn.execute(
-                "SELECT 1 FROM people WHERE person_id = ?",
-                (person_id,),
+                "SELECT 1 FROM people WHERE user_id = %s AND person_id = %s",
+                (self._user_id, person_id),
             ).fetchone()
             if exists is None:
                 raise ValueError("unknown person")
             self._conn.execute(
                 """
                 UPDATE people SET
-                    handoff_who = ?,
-                    handoff_wanted = ?,
-                    handoff_happened = ?,
-                    handoff_they_want = ?,
-                    updated_at = CURRENT_TIMESTAMP
-                WHERE person_id = ?
+                    handoff_who = %s,
+                    handoff_wanted = %s,
+                    handoff_happened = %s,
+                    handoff_they_want = %s,
+                    updated_at = people_timestamp()
+                WHERE user_id = %s AND person_id = %s
                 """,
-                (who, wanted, happened, they_want, person_id),
+                (who, wanted, happened, they_want, self._user_id, person_id),
             )
-            self._conn.commit()
             row = self._conn.execute(
-                "SELECT * FROM people WHERE person_id = ?",
-                (person_id,),
+                "SELECT * FROM people WHERE user_id = %s AND person_id = %s",
+                (self._user_id, person_id),
             ).fetchone()
         person = self._person_dict(row)
         assert person is not None
@@ -1843,7 +1691,7 @@ class PersonStore:
         return matched
 
     def _search_result(
-        self, row: sqlite3.Row, *, match_kind: str
+        self, row: Row, *, match_kind: str
     ) -> dict[str, Any]:
         """Lean identity projection for the finder.
 
@@ -1891,13 +1739,14 @@ class PersonStore:
         capped = min(max(int(limit or 0), 1), SEARCH_LIMIT_MAX)
         query_lower = query.lower()
         tokens = [token for token in query_lower.split() if token]
-        with self._lock:
+        with self.transaction():
             rows = self._conn.execute(
                 """
                 SELECT * FROM people
-                WHERE deleted_at IS NULL
+                WHERE user_id = %s AND deleted_at IS NULL
                 ORDER BY updated_at DESC, person_id
-                """
+                """,
+                (self._user_id,),
             ).fetchall()
         results: list[dict[str, Any]] = []
         for row in rows:
@@ -1975,9 +1824,10 @@ class PersonStore:
           deliberately conservative (exact first+last only, never a masked
           surname) to avoid false positives, and it never merges anything.
         """
-        with self._lock:
+        with self.transaction():
             rows = self._conn.execute(
-                "SELECT * FROM people WHERE deleted_at IS NULL"
+                "SELECT * FROM people WHERE user_id = %s AND deleted_at IS NULL",
+                (self._user_id,),
             ).fetchall()
         by_apollo: dict[str, dict[str, Any]] = {}
         by_name: dict[str, list[dict[str, Any]]] = {}
@@ -2050,7 +1900,7 @@ class PersonStore:
             if fields.get(field):
                 fields[field] = without_apollo_name_masks(fields[field])
         self._require_audit(actor, rationale_summary)
-        with self._lock:
+        with self.transaction():
             row = self._load_person_row(person_id)
             if int(row["version"]) != expected_version:
                 raise ValueError(
@@ -2058,19 +1908,18 @@ class PersonStore:
                 )
             now = self._now()
             next_version = expected_version + 1
-            assignments = [f"{key} = ?" for key in fields]
+            assignments = [f"{key} = %s" for key in fields]
             values: list[Any] = [fields[key] for key in fields]
-            values.extend([next_version, now, person_id, expected_version])
+            values.extend([next_version, now, self._user_id, person_id, expected_version])
             cursor = self._conn.execute(
                 f"""
                 UPDATE people
-                SET {", ".join([*assignments, "version = ?", "updated_at = ?"])}
-                WHERE person_id = ? AND version = ?
+                SET {", ".join([*assignments, "version = %s", "updated_at = %s"])}
+                WHERE user_id = %s AND person_id = %s AND version = %s
                 """,
                 values,
             )
             if cursor.rowcount != 1:
-                self._conn.rollback()
                 raise ValueError("stale record version")
             self._bump_identity_revision(person_id, row)
             self._receipt(
@@ -2083,7 +1932,6 @@ class PersonStore:
                 run_id=run_id,
             )
             self._snapshot(person_id, next_version, now)
-            self._conn.commit()
         person = self.get(person_id)
         assert person is not None
         return person
@@ -2106,9 +1954,7 @@ class PersonStore:
         allowed_source_ids: set[str] | None = None,
     ) -> dict[str, Any]:
         """Save a slot through the same atomic writer used by CRM analysis."""
-        with self._lock, self._conn:
-            if not self._conn.in_transaction:
-                self._conn.execute("BEGIN IMMEDIATE")
+        with self.transaction():
             return self._patch_description_uncommitted(
                 person_id, slot, expected_version=expected_version, text=text,
                 release=release, actor=actor, rationale_summary=rationale_summary,
@@ -2169,6 +2015,9 @@ class PersonStore:
         operation = _clean_operation_id(operation_id) if operation_id is not None else None
         if not self._conn.in_transaction:
             raise RuntimeError("description writer requires a transaction")
+        # The slot version check and the write below must not interleave
+        # with another writer.
+        self.lock_writes()
         self._load_person_row(person_id)
         refs = source_ids(self, person_id, source_refs, allowed_source_ids)
         fingerprint = _fingerprint({
@@ -2181,11 +2030,11 @@ class PersonStore:
             fingerprint = _fingerprint({"base": fingerprint, "restore": restore, "compensates": compensates_change_id})
         if operation is not None:
             prior = self._conn.execute(
-                "SELECT payload FROM events WHERE external_key = ?",
-                (f"crm-operation:{operation}",),
+                "SELECT payload FROM events WHERE user_id = %s AND external_key = %s",
+                (self._user_id, f"crm-operation:{operation}"),
             ).fetchone()
             task_operation = self._conn.execute(
-                "SELECT 1 FROM crm_operations WHERE operation_id = ?", (operation,)
+                "SELECT 1 FROM crm_operations WHERE user_id = %s AND operation_id = %s", (self._user_id, operation)
             ).fetchone()
             if task_operation:
                 raise TaskConflict("operation id already belongs to a task change", code="operation_conflict")
@@ -2196,16 +2045,9 @@ class PersonStore:
                 response = payload["crm_response"]
                 source_ids(self, person_id, response["description"]["source_refs"], allowed_source_ids)
                 return {**response, "replayed": True}
-        history_enabled = self._crm_description_history_ready()
-        declared_version = int(self._conn.execute("PRAGMA user_version").fetchone()[0])
-        if not history_enabled and not (human and restore is None and 0 <= declared_version < SCHEMA_VERSION):
-            raise CrmMigrationRequired()
-        # Existing releases saved human descriptions in event receipts only.
-        # Keep that safe path available until the registered migration runs;
-        # it cannot add v6 rows that historical migrations cannot express.
         current = self._conn.execute(
-            "SELECT * FROM person_descriptions WHERE person_id = ? AND slot = ?",
-            (person_id, slot),
+            "SELECT * FROM person_descriptions WHERE user_id = %s AND person_id = %s AND slot = %s",
+            (self._user_id, person_id, slot),
         ).fetchone()
         current_version = int(current["version"]) if current is not None else 0
         if current_version != expected_version:
@@ -2236,10 +2078,10 @@ class PersonStore:
         self._conn.execute(
             """
             INSERT INTO person_descriptions (
-                person_id, slot, text, authority, source_refs, version,
+                user_id, person_id, slot, text, authority, source_refs, version,
                 created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(person_id, slot) DO UPDATE SET
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (user_id, person_id, slot) DO UPDATE SET
                 text = excluded.text,
                 authority = excluded.authority,
                 source_refs = excluded.source_refs,
@@ -2247,6 +2089,7 @@ class PersonStore:
                 updated_at = excluded.updated_at
             """,
             (
+                self._user_id,
                 person_id,
                 slot,
                 new_text,
@@ -2260,12 +2103,12 @@ class PersonStore:
         person_row = self._load_person_row(person_id)
         next_person_version = int(person_row["version"] or 1) + 1
         self._conn.execute(
-            "UPDATE people SET version = ?, updated_at = ? WHERE person_id = ?",
-            (next_person_version, now, person_id),
+            "UPDATE people SET version = %s, updated_at = %s WHERE user_id = %s AND person_id = %s",
+            (next_person_version, now, self._user_id, person_id),
         )
         description = self._descriptions(person_id)[slot]
         event_id = _new_event_id()
-        change_id = "chg_" + uuid.uuid4().hex if history_enabled else event_id
+        change_id = "chg_" + uuid.uuid4().hex
         response = {"description": description, "change": {
             "change_id": change_id, "entity_type": "description",
             "entity_id": f"{person_id}:{slot}", "entity_version": next_slot_version,
@@ -2280,23 +2123,22 @@ class PersonStore:
         if operation is not None:
             payload.update(fingerprint=fingerprint, crm_response=response)
         self._conn.execute(
-            """INSERT INTO events (event_id, person_id, source, kind, summary,
+            """INSERT INTO events (user_id, event_id, person_id, source, kind, summary,
                    payload, actor, session_id, run_id, external_key)
-               VALUES (?, ?, 'sourcecado', 'description', ?, ?, ?, ?, ?, ?)""",
-            (event_id, person_id, rationale_summary.strip(), json.dumps(payload),
+               VALUES (%s, %s, %s, 'sourcecado', 'description', %s, %s, %s, %s, %s, %s)""",
+            (self._user_id, event_id, person_id, rationale_summary.strip(), json.dumps(payload),
              actor, session_id, run_id, f"crm-operation:{operation}" if operation else None),
         )
         before = self._description_dict(current) if current is not None else self._default_description(slot)
-        if history_enabled:
-            self._conn.execute(
-                """INSERT INTO crm_changes (change_id, person_id, entity_type, entity_id,
-                       entity_version, action, before_json, after_json, actor, reason,
-                       source_refs, operation_id, session_id, run_id, compensates_change_id, created_at)
-                   VALUES (?, ?, 'description', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (change_id, person_id, f"{person_id}:{slot}", next_slot_version,
-                 "undo" if compensates_change_id else "update", json.dumps(before), json.dumps(description), actor, rationale_summary.strip()[:500],
-                 json.dumps(refs), operation or change_id, session_id, run_id, compensates_change_id, now),
-            )
+        self._conn.execute(
+            """INSERT INTO crm_changes (user_id, change_id, person_id, entity_type, entity_id,
+                   entity_version, action, before_json, after_json, actor, reason,
+                   source_refs, operation_id, session_id, run_id, compensates_change_id, created_at)
+               VALUES (%s, %s, %s, 'description', %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+            (self._user_id, change_id, person_id, f"{person_id}:{slot}", next_slot_version,
+             "undo" if compensates_change_id else "update", json.dumps(before), json.dumps(description), actor, rationale_summary.strip()[:500],
+             json.dumps(refs), operation or change_id, session_id, run_id, compensates_change_id, now),
+        )
         self._snapshot(person_id, next_person_version, now)
         return response if operation is not None else description
 
@@ -2341,9 +2183,9 @@ class PersonStore:
             existing = self._conn.execute(
                 """
                 SELECT * FROM person_attachments
-                WHERE person_id = ? AND record_type = ? AND idempotency_key = ?
+                WHERE user_id = %s AND person_id = %s AND record_type = %s AND idempotency_key = %s
                 """,
-                (person_id, record_type, idempotency_key),
+                (self._user_id, person_id, record_type, idempotency_key),
             ).fetchone()
             if existing is not None:
                 current = self._attachment_dict(existing)
@@ -2359,11 +2201,12 @@ class PersonStore:
             self._conn.execute(
                 """
                 INSERT INTO person_attachments (
-                    id, person_id, record_type, idempotency_key, fields_json,
+                    user_id, id, person_id, record_type, idempotency_key, fields_json,
                     restricted, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """,
                 (
+                    self._user_id,
                     record_id,
                     person_id,
                     record_type,
@@ -2376,8 +2219,8 @@ class PersonStore:
             )
             next_version = int(row["version"] or 1) + 1
             self._conn.execute(
-                "UPDATE people SET version = ?, updated_at = ? WHERE person_id = ?",
-                (next_version, now, person_id),
+                "UPDATE people SET version = %s, updated_at = %s WHERE user_id = %s AND person_id = %s",
+                (next_version, now, self._user_id, person_id),
             )
             self._receipt(
                 person_id,
@@ -2390,7 +2233,7 @@ class PersonStore:
             )
             self._snapshot(person_id, next_version, now)
             stored = self._conn.execute(
-                "SELECT * FROM person_attachments WHERE id = ?", (record_id,)
+                "SELECT * FROM person_attachments WHERE user_id = %s AND id = %s", (self._user_id, record_id)
             ).fetchone()
         return _public(self._attachment_dict(stored))
 
@@ -2409,7 +2252,7 @@ class PersonStore:
         if not outcome.strip():
             raise ValueError("outcome is required")
         self._require_audit(actor, rationale_summary)
-        with self._lock:
+        with self.transaction():
             row = self._load_person_row(person_id)
             if int(row["version"]) != expected_version:
                 raise ValueError(
@@ -2419,13 +2262,12 @@ class PersonStore:
             next_version = expected_version + 1
             cursor = self._conn.execute(
                 """
-                UPDATE people SET outcome = ?, version = ?, updated_at = ?
-                WHERE person_id = ? AND version = ?
+                UPDATE people SET outcome = %s, version = %s, updated_at = %s
+                WHERE user_id = %s AND person_id = %s AND version = %s
                 """,
-                (outcome.strip(), next_version, now, person_id, expected_version),
+                (outcome.strip(), next_version, now, self._user_id, person_id, expected_version),
             )
             if cursor.rowcount != 1:
-                self._conn.rollback()
                 raise ValueError("stale record version")
             self._receipt(
                 person_id,
@@ -2437,7 +2279,6 @@ class PersonStore:
                 run_id=run_id,
             )
             self._snapshot(person_id, next_version, now)
-            self._conn.commit()
         person = self.get(person_id)
         assert person is not None
         return person
@@ -2454,7 +2295,7 @@ class PersonStore:
         run_id: str | None = None,
     ) -> dict[str, Any]:
         self._require_audit(actor, rationale_summary)
-        with self._lock, self._conn:
+        with self.transaction():
             row = self._load_person_row(person_id)
             if int(row["version"]) != expected_version:
                 raise ValueError(
@@ -2463,9 +2304,9 @@ class PersonStore:
             snapshot = self._conn.execute(
                 """
                 SELECT * FROM person_versions
-                WHERE person_id = ? AND version = ?
+                WHERE user_id = %s AND person_id = %s AND version = %s
                 """,
-                (person_id, to_version),
+                (self._user_id, person_id, to_version),
             ).fetchone()
             if snapshot is None:
                 raise ValueError(f"unknown record version {to_version}")
@@ -2494,13 +2335,13 @@ class PersonStore:
             cursor = self._conn.execute(
                 """
                 UPDATE people SET
-                    first_name = ?, last_name = ?,
-                    apollo_last_name_obfuscated = COALESCE(?, apollo_last_name_obfuscated),
-                    title = ?, company = ?, target = ?,
-                    sequence_state = ?, outcome = ?,
-                    handoff_who = ?, handoff_wanted = ?, handoff_happened = ?,
-                    handoff_they_want = ?, version = ?, updated_at = ?
-                WHERE person_id = ? AND version = ?
+                    first_name = %s, last_name = %s,
+                    apollo_last_name_obfuscated = COALESCE(%s, apollo_last_name_obfuscated),
+                    title = %s, company = %s, target = %s,
+                    sequence_state = %s, outcome = %s,
+                    handoff_who = %s, handoff_wanted = %s, handoff_happened = %s,
+                    handoff_they_want = %s, version = %s, updated_at = %s
+                WHERE user_id = %s AND person_id = %s AND version = %s
                 """,
                 (
                     target.get("first_name"),
@@ -2517,12 +2358,12 @@ class PersonStore:
                     without_apollo_name_masks(target.get("handoff_they_want")) or None,
                     next_version,
                     now,
+                    self._user_id,
                     person_id,
                     expected_version,
                 ),
             )
             if cursor.rowcount != 1:
-                self._conn.rollback()
                 raise ValueError("stale record version")
             from coworker.person_corrections import note_field_changes
             note_field_changes(self,person_id,row,human=actor=="director",reason=rationale_summary)
@@ -2531,32 +2372,33 @@ class PersonStore:
             # current source rows they depend on, including current restrictions,
             # rather than replacing their evidence from a person snapshot.
             task_sources = set()
-            for source_row in self._conn.execute("""SELECT source_refs FROM person_tasks WHERE person_id=?
-                UNION ALL SELECT source_refs FROM crm_changes WHERE person_id=?
-                UNION ALL SELECT source_refs FROM crm_proposals WHERE person_id=?""",
-                (person_id, person_id, person_id)):
+            for source_row in self._conn.execute("""SELECT source_refs FROM person_tasks WHERE user_id=%s AND person_id=%s
+                UNION ALL SELECT source_refs FROM crm_changes WHERE user_id=%s AND person_id=%s
+                UNION ALL SELECT source_refs FROM crm_proposals WHERE user_id=%s AND person_id=%s""",
+                (self._user_id, person_id, self._user_id, person_id, self._user_id, person_id)):
                 task_sources.update(json.loads(source_row[0]))
             for desc in self._descriptions(person_id).values():
                 task_sources.update(desc['source_refs'])
-            task_sources.update(r[0] for r in self._conn.execute('SELECT id FROM person_attachments WHERE person_id=? AND restricted=1',(person_id,)))
-            if self._conn.execute("SELECT 1 FROM sqlite_master WHERE name='crm_task_evidence'").fetchone():
-                task_sources.update(r[0] for r in self._conn.execute("""SELECT e.source_id FROM crm_task_evidence e
-                    JOIN crm_proposals p ON p.proposal_id=e.proposal_id WHERE p.person_id=?""", (person_id,)))
-            preserved = {r[0] for r in self._conn.execute("SELECT id FROM person_attachments WHERE person_id=?", (person_id,))} & task_sources
-            placeholders = ",".join("?" for _ in preserved)
-            self._conn.execute("DELETE FROM person_attachments WHERE person_id=?" +
-                (f" AND id NOT IN ({placeholders})" if preserved else ""), (person_id, *sorted(preserved)))
+            task_sources.update(r[0] for r in self._conn.execute('SELECT id FROM person_attachments WHERE user_id = %s AND person_id=%s AND restricted=1',(self._user_id, person_id)))
+            task_sources.update(r[0] for r in self._conn.execute("""SELECT e.source_id FROM crm_task_evidence e
+                JOIN crm_proposals p ON p.user_id=e.user_id AND p.proposal_id=e.proposal_id
+                WHERE e.user_id=%s AND p.person_id=%s""", (self._user_id, person_id)))
+            preserved = {r[0] for r in self._conn.execute("SELECT id FROM person_attachments WHERE user_id = %s AND person_id=%s", (self._user_id, person_id))} & task_sources
+            placeholders = ",".join("%s" for _ in preserved)
+            self._conn.execute("DELETE FROM person_attachments WHERE user_id=%s AND person_id=%s" +
+                (f" AND id NOT IN ({placeholders})" if preserved else ""), (self._user_id, person_id, *sorted(preserved)))
             for item in attachments:
                 if item["id"] in preserved:
                     continue
                 self._conn.execute(
                     """
                     INSERT INTO person_attachments (
-                        id, person_id, record_type, idempotency_key, fields_json,
+                        user_id, id, person_id, record_type, idempotency_key, fields_json,
                         restricted, created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
                     """,
                     (
+                        self._user_id,
                         item["id"],
                         person_id,
                         item["type"],
@@ -2579,7 +2421,6 @@ class PersonStore:
                 run_id=run_id,
             )
             self._snapshot(person_id, next_version, now)
-            self._conn.commit()
         person = self.get(person_id)
         assert person is not None
         return person
@@ -2595,7 +2436,7 @@ class PersonStore:
         run_id: str | None = None,
     ) -> dict[str, Any]:
         self._require_audit(actor, rationale_summary)
-        with self._lock:
+        with self.transaction():
             row = self._load_person_row(person_id)
             if int(row["version"]) != expected_version:
                 raise ValueError(
@@ -2605,10 +2446,10 @@ class PersonStore:
             next_version = expected_version + 1
             self._conn.execute(
                 """
-                UPDATE people SET deleted_at = ?, version = ?, updated_at = ?
-                WHERE person_id = ? AND version = ?
+                UPDATE people SET deleted_at = %s, version = %s, updated_at = %s
+                WHERE user_id = %s AND person_id = %s AND version = %s
                 """,
-                (now, next_version, now, person_id, expected_version),
+                (now, next_version, now, self._user_id, person_id, expected_version),
             )
             self._receipt(
                 person_id,
@@ -2619,17 +2460,16 @@ class PersonStore:
                 session_id=session_id,
                 run_id=run_id,
             )
-            self._conn.commit()
         return {"deleted": True, "id": person_id}
 
     def versions(self, person_id: str) -> list[dict[str, Any]]:
-        with self._lock:
+        with self.transaction():
             rows = self._conn.execute(
                 """
                 SELECT version, created_at FROM person_versions
-                WHERE person_id = ? ORDER BY version
+                WHERE user_id = %s AND person_id = %s ORDER BY version
                 """,
-                (person_id,),
+                (self._user_id, person_id),
             ).fetchall()
         return [
             {"version": int(row["version"]), "created_at": str(row["created_at"])}

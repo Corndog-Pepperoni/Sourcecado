@@ -237,46 +237,6 @@ LEGACY_CONVERSATION_DDL = """
     );
 """
 
-# The person schema before attachments, versions, and soft delete landed.
-LEGACY_PEOPLE_DDL = """
-    CREATE TABLE people (
-        person_id TEXT PRIMARY KEY,
-        apollo_id TEXT UNIQUE,
-        first_name TEXT,
-        last_name TEXT,
-        title TEXT,
-        company TEXT,
-        email TEXT,
-        linkedin_url TEXT,
-        phone TEXT,
-        sequence_state TEXT,
-        target TEXT,
-        handoff_who TEXT,
-        handoff_wanted TEXT,
-        handoff_happened TEXT,
-        handoff_they_want TEXT,
-        created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-        updated_at TEXT DEFAULT CURRENT_TIMESTAMP
-    );
-    CREATE TABLE events (
-        event_id TEXT PRIMARY KEY,
-        person_id TEXT NOT NULL,
-        source TEXT NOT NULL,
-        kind TEXT NOT NULL,
-        summary TEXT NOT NULL,
-        payload TEXT NOT NULL DEFAULT '{}',
-        actor TEXT NOT NULL,
-        session_id TEXT,
-        run_id TEXT,
-        tool TEXT,
-        created_at TEXT DEFAULT CURRENT_TIMESTAMP
-    );
-    CREATE TABLE session_people (
-        session_id TEXT PRIMARY KEY,
-        person_id TEXT NOT NULL
-    );
-"""
-
 LEGACY_PERSON_ID = "per_0f3c9a1b4d2e4f6a8b0c1d2e3f405162"
 
 
@@ -341,58 +301,6 @@ def build_legacy_state(root: Path, *, plant_secrets: bool = False) -> Path:
     conn.close()
     os.chmod(root / "club.db", 0o600)
 
-    conn = sqlite3.connect(root / "people.db")
-    conn.executescript(LEGACY_PEOPLE_DDL)
-    conn.execute(
-        """
-        INSERT INTO people
-            (person_id, apollo_id, first_name, last_name, title, company, email,
-             linkedin_url, sequence_state, target)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            LEGACY_PERSON_ID,
-            "apollo_5501",
-            "Dana",
-            "Ruiz",
-            "Technical Recruiter",
-            "Rippling",
-            "dana@example.com",
-            "https://www.linkedin.com/in/dana-ruiz",
-            "open",
-            "Rippling",
-        ),
-    )
-    conn.execute(
-        """
-        INSERT INTO events
-            (event_id, person_id, source, kind, summary, payload, actor, session_id, tool)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            "evt_1",
-            LEGACY_PERSON_ID,
-            "gmail",
-            "draft",
-            "Drafted intro mail",
-            json.dumps(
-                {
-                    "draft_id": "draft_991",
-                    "body": PLANTED_BODY if plant_secrets else "hello",
-                }
-            ),
-            "assistant",
-            "main",
-            "gmail_draft",
-        ),
-    )
-    conn.execute(
-        "INSERT INTO session_people (session_id, person_id) VALUES (?, ?)",
-        ("main", LEGACY_PERSON_ID),
-    )
-    conn.commit()
-    conn.close()
-    os.chmod(root / "people.db", 0o600)
 
     conv_dir = root / "conversations"
     conv_dir.mkdir(exist_ok=True)

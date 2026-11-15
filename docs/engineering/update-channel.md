@@ -51,7 +51,7 @@ Ed25519 signature over the canonical bytes of `signed`.
     "artifact_size": 234995,
     "artifact_sha256": "988e24b7…",
     "minimum_upgradable_version": "0.0.1",
-    "state_versions": { "people_db": 1, "conversation_db": 1, "…": 0 },
+    "state_versions": { "mcp_config": 1, "…": 0 },
     "released_at": "2026-08-28T05:56:38Z",
     "commit": "fcb6e64aca18c836fa807ee0a009ccd2c9ca3c8a"
   },
@@ -255,13 +255,12 @@ so the prose and the code cannot drift.
 | Exercise | Test | What it proves |
 | --- | --- | --- |
 | Clean install | `test_exercise_clean_install` | No previous application and no previous state. Installs, takes no backup, migrates nothing. |
-| Upgrade from the prior preview | `test_exercise_upgrade_from_the_prior_preview` | State written by the previous build's schema comes forward. Backup taken, `people_db` migrated, nothing pending afterwards, previous bundle kept. |
+| Upgrade from the prior preview | `test_exercise_upgrade_from_the_prior_preview` | State written by the previous build's schema comes forward. Backup taken, `conversation_transcripts` migrated, nothing pending afterwards, previous bundle kept. |
 | Failed update | `test_exercise_failed_update_restores_the_last_usable_version` | The launch check fails. Bundle back at the old version, staging cleared, every store version back where it started, and Doctor does not disagree. |
 | Rollback | `test_exercise_rollback_after_a_successful_update` | A clean update is deliberately reversed. Bundle and every store restored. |
-| Preserved person file | `test_exercise_the_person_file_reads_back_through_its_own_store` and `test_exercise_the_person_file_survives_a_failed_update_and_a_rollback` | The person file opens through `PersonStore` after the upgrade, with name, company, email, sequence state, and timeline intact — and survives a failed update and a rollback unchanged. |
 
-The person-file exercise is the one a user would notice. A failed update is
-visible; a lost person file is not.
+Person files are no longer in the state directory. They moved to Postgres in
+migration slice S04, so the update channel does not migrate them.
 
 ## Credentials, and the four surfaces they could leak through
 

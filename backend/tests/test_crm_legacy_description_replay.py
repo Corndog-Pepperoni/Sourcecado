@@ -1,10 +1,9 @@
-"""Exact retries of v7 attention description receipts survive the schema join."""
+"""Exact retries of description receipts that the v7 attention writer stored."""
 
 import pytest
 from coworker.people import PersonStore
 from coworker.crm_service import CrmService
 from coworker.crm_tasks import TaskConflict, _fingerprint
-from coworker.migrations import apply_migrations
 
 
 def historical_save(people, pid, *, sources=()):
@@ -59,36 +58,6 @@ def setup(tmp_path, sources=()):
         company="Lumen",
     )["person_id"]
     return people, pid
-
-
-def test_legacy_description_save_retry_after_upgrade_and_restart(tmp_path):
-    people, pid = setup(tmp_path)
-    saved = historical_save(people, pid)
-    people._conn.execute("PRAGMA user_version=7")
-    people._conn.commit()
-    people._conn.close()
-    assert apply_migrations(tmp_path).error is None
-    people = PersonStore(tmp_path)
-    service = CrmService(people)
-    replay = service.save_description(
-        pid,
-        "general",
-        text="Saved human context",
-        expected_version=0,
-        operation_id="legacy-description-save",
-    )
-    assert replay["replayed"] and replay["description"] == saved["description"]
-    assert replay["change"]["change_id"] == saved["change"]["change_id"]
-    assert people.descriptions(pid)["general"]["version"] == 1
-    with pytest.raises(TaskConflict, match="operation"):
-        service.save_description(
-            pid,
-            "general",
-            text="Different wording",
-            expected_version=0,
-            operation_id="legacy-description-save",
-        )
-    assert people.descriptions(pid)["general"]["text"] == "Saved human context"
 
 
 def test_legacy_description_replay_rechecks_revoked_source_grant(tmp_path):

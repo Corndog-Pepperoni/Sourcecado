@@ -354,56 +354,10 @@ def test_correction_record_failure_rolls_back_values_controls_and_identity_revis
     assert p.get(pid) == before
     assert (
         p._conn.execute(
-            "SELECT count(*) FROM person_field_controls WHERE person_id=?", (pid,)
+            "SELECT count(*) FROM person_field_controls WHERE user_id=%s AND person_id=%s", (p._user_id, pid)
         ).fetchone()[0]
         == 0
     )
-
-
-def test_schema_9_correction_upgrade_is_backed_up_and_can_roll_back(
-    tmp_path, monkeypatch
-):
-    import dataclasses
-    from coworker import migrations
-
-    p = PersonStore(tmp_path)
-    pid = person(p)
-    p._conn.execute("DROP TABLE person_field_controls")
-    p._conn.execute("DROP TABLE person_correction_conflicts")
-    p._conn.execute("PRAGMA user_version=9")
-    p._conn.commit()
-    before = p.get(pid)
-    p._conn.close()
-    spec = migrations.spec_for("people_db")
-    original = next(step for step in spec.migrations if step.from_version == 9)
-
-    def fail(context):
-        original.apply(context)
-        raise RuntimeError("Interrupted correction migration")
-
-    broken = dataclasses.replace(
-        spec,
-        migrations=tuple(
-            dataclasses.replace(step, apply=fail) if step.from_version == 9 else step
-            for step in spec.migrations
-        ),
-    )
-    monkeypatch.setattr(
-        migrations,
-        "REGISTRY",
-        tuple(
-            broken if item.store_id == "people_db" else item
-            for item in migrations.REGISTRY
-        ),
-    )
-    result = migrations.apply_migrations(tmp_path)
-    assert result.error and result.backup_id
-    monkeypatch.undo()
-    assert migrations.apply_migrations(tmp_path).error is None
-    p = PersonStore(tmp_path)
-    assert p.get(pid) == before
-    assert p._conn.execute("PRAGMA user_version").fetchone()[0] == 10
-    assert p._conn.execute("PRAGMA foreign_key_check").fetchall() == []
 
 
 def test_paid_result_filing_failure_rolls_back_details_conflicts_and_identity(
@@ -438,7 +392,7 @@ def test_paid_result_filing_failure_rolls_back_details_conflicts_and_identity(
         )
     assert p.get(pid) == before
     assert not p._conn.execute(
-        "SELECT 1 FROM events WHERE person_id=? AND kind='enrich'", (pid,)
+        "SELECT 1 FROM events WHERE user_id=%s AND person_id=%s AND kind='enrich'", (p._user_id, pid)
     ).fetchone()
 
 
@@ -466,7 +420,7 @@ def test_paid_result_receipt_replay_does_not_apply_again_after_a_human_correctio
     assert replay['replayed']
     assert p.get(pid)==before
     assert replay['fields_applied']==first['fields_applied']
-    assert p._conn.execute("SELECT count(*) FROM events WHERE person_id=? AND kind='enrich'",(pid,)).fetchone()[0]==1
+    assert p._conn.execute("SELECT count(*) FROM events WHERE user_id=%s AND person_id=%s AND kind='enrich'",(p._user_id,pid)).fetchone()[0]==1
     assert p.get_apollo_enrichment_receipt(pid,kwargs['approval_id'])['source_ref']['id']==first['source_ref']['id']
 
 

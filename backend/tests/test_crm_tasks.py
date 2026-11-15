@@ -1,6 +1,6 @@
 """Person tasks: one saved record behind the global Tasks view and each person file."""
 
-import sqlite3
+import psycopg
 from datetime import UTC, datetime
 
 import pytest
@@ -233,33 +233,36 @@ def test_missing_or_deleted_people_cannot_hold_tasks(tmp_path):
     )
     # The historical task is preserved, not erased with the person.
     row = people._conn.execute(
-        "SELECT title FROM person_tasks WHERE task_id = ?", (task["task_id"],)
+        "SELECT title FROM person_tasks WHERE user_id = %s AND task_id = %s",
+        (people._user_id, task["task_id"]),
     ).fetchone()
     assert row["title"] == "Before"
 
 
 def test_the_database_itself_refuses_a_task_for_a_missing_person(tmp_path):
     people = PersonStore(tmp_path)
-    with pytest.raises(sqlite3.IntegrityError):
-        people._conn.execute(
-            """
-            INSERT INTO person_tasks (
-                task_id, person_id, title, origin, created_at, updated_at
-            ) VALUES ('task_x', 'per_missing', 'Orphan', 'human', 'now', 'now')
-            """
-        )
-    people._conn.rollback()
-    with pytest.raises(sqlite3.IntegrityError):
-        people._conn.execute(
-            """
-            INSERT INTO crm_changes (
-                change_id, person_id, entity_type, entity_id, entity_version,
-                action, after_json, actor, reason, operation_id, created_at
-            ) VALUES ('chg_x', 'per_missing', 'task', 'task_x', 1, 'create',
-                      '{}', 'director', 'r', 'op', 'now')
-            """
-        )
-    people._conn.rollback()
+    with pytest.raises(psycopg.errors.ForeignKeyViolation):
+        with people.transaction():
+            people._conn.execute(
+                """
+                INSERT INTO person_tasks (
+                    user_id, task_id, person_id, title, origin, created_at, updated_at
+                ) VALUES (%s, 'task_x', 'per_missing', 'Orphan', 'human', 'now', 'now')
+                """,
+                (people._user_id,),
+            )
+    with pytest.raises(psycopg.errors.ForeignKeyViolation):
+        with people.transaction():
+            people._conn.execute(
+                """
+                INSERT INTO crm_changes (
+                    user_id, change_id, person_id, entity_type, entity_id, entity_version,
+                    action, after_json, actor, reason, operation_id, created_at
+                ) VALUES (%s, 'chg_x', 'per_missing', 'task', 'task_x', 1, 'create',
+                          '{}', 'director', 'r', 'op', 'now')
+                """,
+                (people._user_id,),
+            )
 
 
 def test_a_request_cannot_choose_its_author(tmp_path):
@@ -414,7 +417,6 @@ def test_tasks_survive_a_restart_with_the_same_identity(tmp_path):
     created = _create(
         client, pid, "op-restart-create", title="Send project examples", details="Fintech", due_date="2026-10-16"
     ).json()["task"]
-    app.state.people._conn.close()
 
     # A fresh process: no Gmail, no model provider.
     reopened = create_app(token=TOKEN, state=tmp_path, provider=None)
@@ -476,8 +478,11 @@ def test_receipts_created_before_attention_keep_their_retry_identity(tmp_path):
     args = dict(title="Legacy promise", timezone="UTC", actor="director", operation_id="legacy-operation-retry")
     created = service.create(pid, **args)
     legacy = _fingerprint({"op": "task.create", "person_id": pid, "actor": "director", "title": "Legacy promise", "details": "", "due_date": None})
-    people._conn.execute("UPDATE crm_operations SET fingerprint=? WHERE operation_id=?", (legacy, args["operation_id"]))
-    people._conn.commit()
+    with people.transaction():
+        people._conn.execute(
+            "UPDATE crm_operations SET fingerprint=%s WHERE user_id=%s AND operation_id=%s",
+            (legacy, people._user_id, args["operation_id"]),
+        )
     replay = service.create(pid, **args)
     assert replay["replayed"]
     assert replay["task"]["task_id"] == created["task"]["task_id"]
@@ -685,7 +690,6 @@ def test_a_committed_state_change_is_found_by_operation_id_after_restart(tmp_pat
     task = _create(client, pid, "op-crash-create", title="Call").json()["task"]
     # The server commits, then the process stops before the client sees it.
     _set_state(client, pid, task, "completed", "op-crash-complete")
-    app.state.people._conn.close()
 
     reopened = TestClient(create_app(token=TOKEN, state=tmp_path, provider=None))
     retry = _set_state(reopened, pid, task, "completed", "op-crash-complete")

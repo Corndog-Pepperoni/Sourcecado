@@ -30,7 +30,6 @@ def test_refresh_and_saved_reads_share_activity_and_freshness_after_restart(tmp_
     success = saved["mail_sync"]["last_success_at"]
     app.state.gmail = MissingGmail()
     assert client.post("/v1/replies/refresh", headers=HEADERS).json()["refresh"]["status"] == "failed"
-    app.state.people._conn.close()
     restarted = TestClient(create_app(token="mail-api-test", state=tmp_path, provider=None, gmail=MissingGmail()))
     state = restarted.get("/v1/board?include_mail_state=true", headers=HEADERS).json()["mail_sync"]
     assert state["status"] == "failed"

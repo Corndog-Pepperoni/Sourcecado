@@ -14,11 +14,11 @@ class DescriptionService:
         self.allowed = set(allowed_source_ids or ())
 
     def changes(self, pid: str, slot: str) -> list[dict]:
-        with self.people._lock:
+        with self.people.transaction():
             self.people._load_person_row(pid)
             result = []
             for row in self.people._conn.execute("""SELECT * FROM crm_changes
-                WHERE person_id=? AND entity_type='description' AND entity_id=? ORDER BY rowid""", (pid, f"{pid}:{slot}")):
+                WHERE user_id = %s AND person_id=%s AND entity_type='description' AND entity_id=%s ORDER BY seq""", (self.people._user_id, pid, f"{pid}:{slot}")):
                 item = dict(row)
                 item["source_refs"] = json.loads(item["source_refs"])
                 if not sources_visible(self.people, pid, item["source_refs"], self.allowed):
@@ -37,16 +37,16 @@ class DescriptionService:
         operation_id = _clean_operation_id(operation_id)
         with self.people.crm_transaction():
             self.people._load_person_row(pid)
-            change = self.people._conn.execute("""SELECT * FROM crm_changes WHERE person_id=?
-                AND change_id=? AND entity_type='description'""", (pid, change_id)).fetchone()
+            change = self.people._conn.execute("""SELECT * FROM crm_changes WHERE user_id = %s AND person_id=%s
+                AND change_id=%s AND entity_type='description'""", (self.people._user_id, pid, change_id)).fetchone()
             if change is None:
                 raise ValueError("unknown description change")
             before = json.loads(change["before_json"])
             source_ids(self.people, pid, before["source_refs"], self.allowed)
             source_ids(self.people, pid, json.loads(change["source_refs"]), self.allowed)
             slot = str(change["entity_id"]).rsplit(":", 1)[-1]
-            replay = self.people._conn.execute("SELECT 1 FROM events WHERE external_key=?",
-                (f"crm-operation:{operation_id}",)).fetchone()
+            replay = self.people._conn.execute("SELECT 1 FROM events WHERE user_id = %s AND external_key=%s",
+                (self.people._user_id, f"crm-operation:{operation_id}")).fetchone()
             if not replay and self.people._descriptions(pid)[slot] != json.loads(change["after_json"]):
                 raise TaskConflict("description changed since this change", code="description_conflict")
             result = self.people._patch_description_uncommitted(pid, slot,
@@ -55,5 +55,5 @@ class DescriptionService:
                 allowed_source_ids=self.allowed, operation_id=operation_id,
                 restore=before, compensates_change_id=change_id)
             self.people._conn.execute("""UPDATE crm_proposals SET state='dismissed', resolution='undo',
-                version=version+1, updated_at=? WHERE change_id=? AND state='accepted'""", (self.people._now(), change_id))
+                version=version+1, updated_at=%s WHERE user_id = %s AND change_id=%s AND state='accepted'""", (self.people._now(), self.people._user_id, change_id))
             return result

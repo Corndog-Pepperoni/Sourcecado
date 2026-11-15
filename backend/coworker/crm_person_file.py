@@ -93,10 +93,11 @@ def _versions(people: PersonStore, pid: str, person: dict[str, Any],
                 and type(version) is int and version in wanted):
             shown = event["kind"] not in ATTACHMENT_TYPES or payload.get("id") in visible
             claims.setdefault(version, []).append((shown, event["actor"], event["summary"]))
-    with people._lock:  # Status, attention and detail changes save the person version.
+    with people.transaction():  # Status, attention and detail changes save the person version.
         changes = people._conn.execute(
             "SELECT entity_version, actor, reason, source_refs FROM crm_changes "
-            "WHERE person_id=? AND entity_id=? ORDER BY rowid", (pid, pid)).fetchall()
+            "WHERE user_id=%s AND person_id=%s AND entity_id=%s ORDER BY seq",
+            (people._user_id, pid, pid)).fetchall()
     for change in changes:
         if change["entity_version"] in wanted:
             shown = sources_visible(people, pid, json.loads(change["source_refs"]), allowed_source_ids)

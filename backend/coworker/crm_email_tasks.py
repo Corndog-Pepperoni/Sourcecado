@@ -210,8 +210,10 @@ class EmailTaskWriter:
 
     def _saved_request(self, task: dict) -> str | None:
         row = self.people._conn.execute("""SELECT p.proposed_value FROM crm_proposals p
-            JOIN crm_changes c ON c.change_id=p.change_id WHERE c.entity_type='task'
-            AND c.entity_id=? AND p.target_kind='task_create' ORDER BY c.created_at LIMIT 1""", (task["task_id"],)).fetchone()
+            JOIN crm_changes c ON c.user_id=p.user_id AND c.change_id=p.change_id
+            WHERE p.user_id=%s AND c.entity_type='task'
+            AND c.entity_id=%s AND p.target_kind='task_create' ORDER BY c.created_at LIMIT 1""",
+            (self.people._user_id, task["task_id"])).fetchone()
         if row is None:
             return None
         value = json.loads(row[0])
@@ -239,11 +241,11 @@ class EmailTaskWriter:
         return "uncertain" if set(objects) & set(prior_objects) else "distinct"
 
     def matching_tasks(self, pid: str, request: str) -> list[tuple[dict, str]]:
-        records = [self.tasks._task_dict(row) for row in self.people._conn.execute("SELECT * FROM person_tasks WHERE person_id=?", (pid,))]
+        records = [self.tasks._task_dict(row) for row in self.people._conn.execute("SELECT * FROM person_tasks WHERE user_id = %s AND person_id=%s", (self.people._user_id, pid))]
         return [(task, relation) for task in records if (relation := self.task_relation(task, request)) != "distinct"]
 
     def apply(self, pid: str, candidates: list[dict], evidence, revision: int) -> tuple[list, list]:
-        """Caller owns BEGIN IMMEDIATE covering descriptions and checkpoint too."""
+        """Caller owns the locked transaction covering descriptions and checkpoint too."""
         manifest = {m["key"]: m for m in evidence.manifest}
         messages = {m["key"]: m for m in evidence.messages}
         changes, proposals = [], []
@@ -266,8 +268,8 @@ class EmailTaskWriter:
             identity.update(start=start, end=end)
             fingerprint = _hash(identity)
             intent = "email-task:" + item["kind"]
-            prior = self.people._conn.execute("""SELECT * FROM crm_proposals WHERE person_id=?
-                AND intent_key=? AND support_source_fingerprint=?""", (pid, intent, fingerprint)).fetchone()
+            prior = self.people._conn.execute("""SELECT * FROM crm_proposals WHERE user_id = %s AND person_id=%s
+                AND intent_key=%s AND support_source_fingerprint=%s""", (self.people._user_id, pid, intent, fingerprint)).fetchone()
             if prior:
                 if prior["state"] == "pending":
                     proposals.append(prior["proposal_id"])
@@ -277,7 +279,7 @@ class EmailTaskWriter:
             # the same write lock. No model snapshot can overwrite a human edit.
             matching = self.matching_tasks(pid, request)
             if item.get("task_id") is not None:
-                row = self.people._conn.execute("SELECT * FROM person_tasks WHERE person_id=? AND task_id=?", (pid, item["task_id"])).fetchone()
+                row = self.people._conn.execute("SELECT * FROM person_tasks WHERE user_id = %s AND person_id=%s AND task_id=%s", (self.people._user_id, pid, item["task_id"])).fetchone()
                 if row is None:
                     continue
                 hinted = self.tasks._task_dict(row)
@@ -363,15 +365,15 @@ class EmailTaskWriter:
             # accepted without choosing the saved target in the future review UI.
             if len(matches) > 1:
                 kind, value = "task_update", {"changes": {}, "requires_target_review": True}
-            self.people._conn.execute("""INSERT INTO crm_proposals(proposal_id, person_id, target_kind,
+            self.people._conn.execute("""INSERT INTO crm_proposals(user_id, proposal_id, person_id, target_kind,
                 target_id, proposed_value, expected_target_version, reason, source_refs, intent_key,
                 support_source_fingerprint, input_revision, state, resolution, change_id, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (proposal_id, pid, kind, target["task_id"] if target else None, json.dumps(value),
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+                (self.people._user_id, proposal_id, pid, kind, target["task_id"] if target else None, json.dumps(value),
                  target["version"] if target else 0, reason, json.dumps(refs), intent, fingerprint,
                  revision, "accepted" if change_id else "pending", "automatic" if change_id else None,
                  change_id, self.people._now(), self.people._now()))
             self.people._conn.execute("""INSERT INTO crm_task_evidence
-                (proposal_id, source_id, message_id, body_fingerprint, request_start, request_end)
-                VALUES (?, ?, ?, ?, ?, ?)""", (proposal_id, refs[0], support["message_id"], support["body_fingerprint"], start, end))
+                (user_id, proposal_id, source_id, message_id, body_fingerprint, request_start, request_end)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)""", (self.people._user_id, proposal_id, refs[0], support["message_id"], support["body_fingerprint"], start, end))
         return changes, proposals

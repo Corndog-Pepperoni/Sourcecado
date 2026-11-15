@@ -163,13 +163,13 @@ def test_mail_arriving_after_prepare_stays_pending_for_next_maintenance(tmp_path
     service = worker(people)
     assert asyncio.run(service.analyze(pid))['status'] == 'analyzed'
     with people.crm_transaction() as conn:
-        conn.execute('UPDATE crm_analysis_state SET latest_evidence_revision=1,observed_collection_revision=0 WHERE person_id=?', (pid,))
+        conn.execute('UPDATE crm_analysis_state SET latest_evidence_revision=1,observed_collection_revision=0 WHERE user_id = %s AND person_id=%s', (people._user_id, pid))
     prepare = service._prepare
     def prepare_then_new_mail(person_id):
         prepare(person_id)
         with people.crm_transaction() as conn:
-            conn.execute('UPDATE crm_analysis_state SET latest_evidence_revision=latest_evidence_revision+1 WHERE person_id=?', (person_id,))
+            conn.execute('UPDATE crm_analysis_state SET latest_evidence_revision=latest_evidence_revision+1 WHERE user_id = %s AND person_id=%s', (people._user_id, person_id))
     monkeypatch.setattr(service, '_prepare', prepare_then_new_mail)
     asyncio.run(AnalysisMaintenance(people, lambda: service).run_pending())
-    state = people._conn.execute('SELECT latest_evidence_revision,observed_collection_revision FROM crm_analysis_state WHERE person_id=?', (pid,)).fetchone()
+    state = people._conn.execute('SELECT latest_evidence_revision,observed_collection_revision FROM crm_analysis_state WHERE user_id = %s AND person_id=%s', (people._user_id, pid)).fetchone()
     assert tuple(state) == (2, 1)

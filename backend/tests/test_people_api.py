@@ -453,15 +453,12 @@ def test_legacy_multiple_person_chats_fail_visibly_instead_of_choosing_one(tmp_p
     )
     app.state.store.create_session("legacy-one")
     app.state.store.create_session("legacy-two")
-    with app.state.people._lock:
-        app.state.people._conn.executemany(
-            "INSERT INTO session_people (session_id, person_id) VALUES (?, ?)",
-            [
-                ("legacy-one", person["person_id"]),
-                ("legacy-two", person["person_id"]),
-            ],
-        )
-        app.state.people._conn.commit()
+    with app.state.people.transaction():
+        for session_id in ("legacy-one", "legacy-two"):
+            app.state.people._conn.execute(
+                "INSERT INTO session_people (user_id, session_id, person_id) VALUES (%s, %s, %s)",
+                (app.state.people._user_id, session_id, person["person_id"]),
+            )
 
     response = TestClient(app, raise_server_exceptions=False).get(
         f"/v1/people/{person['person_id']}", headers={TOKEN_HEADER: TOKEN}

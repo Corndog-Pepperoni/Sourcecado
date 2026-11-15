@@ -135,7 +135,7 @@ def _replacement(value: str) -> str:
 
 
 def crm_outcome_references(result: dict[str, Any]) -> dict[str, Any]:
-    """Runtime-authored pointers only; source and entity content stay in people.db."""
+    """Runtime-authored pointers only; source and entity content stay in the people store."""
     change = result.get("change")
     if not isinstance(change, dict) or not change.get("change_id"):
         return {}
@@ -254,12 +254,12 @@ def _reminder_date(text: str, directive: Directive, timezone: str) -> str | None
 
 def _saved_task_operation(people: PersonStore, person_id: str, operation_id: str) -> dict | None:
     """Only target/date metadata; the writer still verifies fingerprint and access."""
-    with people._lock:
+    with people.transaction():
         row = people._conn.execute(
             """SELECT c.entity_id, c.action, c.after_json, c.compensates_change_id FROM crm_operations o
-               JOIN crm_changes c ON c.change_id = o.change_id
-               WHERE o.operation_id = ? AND c.person_id = ? AND c.entity_type = 'task'""",
-            (operation_id, person_id),
+               JOIN crm_changes c ON c.user_id = o.user_id AND c.change_id = o.change_id
+               WHERE o.user_id = %s AND o.operation_id = %s AND c.person_id = %s AND c.entity_type = 'task'""",
+            (people._user_id, operation_id, person_id),
         ).fetchone()
     return ({"task_id": row["entity_id"], "action": row["action"],
              "compensates_change_id": row["compensates_change_id"],
@@ -304,14 +304,15 @@ def _verify_task_target(name: str, args: dict, people: PersonStore, person_id: s
     else:
         if not str(args["change_id"]).startswith("chg_"):
             return  # The adapter reports the pending non-task undo capability.
-        with people._lock:
+        with people.transaction():
             rows = people._conn.execute(
                 """SELECT c.change_id, c.entity_id AS task_id, c.entity_version AS version,
                           c.action, c.person_id, c.entity_id, c.entity_version, c.before_json,
                           t.title, t.source_refs FROM crm_changes c
-                   JOIN person_tasks t ON t.task_id = c.entity_id AND t.person_id = c.person_id
-                   WHERE c.person_id = ? AND c.entity_type = 'task'
-                     AND c.entity_version = t.version""", (person_id,),
+                   JOIN person_tasks t ON t.user_id = c.user_id AND t.task_id = c.entity_id
+                     AND t.person_id = c.person_id
+                   WHERE c.user_id = %s AND c.person_id = %s AND c.entity_type = 'task'
+                     AND c.entity_version = t.version""", (people._user_id, person_id),
             ).fetchall()
             rows = [row for row in rows if TaskService(people)._can_undo(row)]
         eligible_records = [dict(row) for row in rows
@@ -669,13 +670,13 @@ def execute_crm_tool(name: str, arguments: dict, *, people: PersonStore, store: 
         saved_operation = _saved_task_operation(people, pid, args["operation_id"])
         undo_kind = None
         if name in {"crm_undo_change", "crm_resolve_proposal"}:
-            with people._lock:
+            with people.transaction():
                 if name == "crm_undo_change":
-                    row = people._conn.execute("SELECT * FROM crm_changes WHERE person_id=? AND change_id=?",
-                        (pid, args["change_id"])).fetchone()
+                    row = people._conn.execute("SELECT * FROM crm_changes WHERE user_id = %s AND person_id=%s AND change_id=%s",
+                        (people._user_id, pid, args["change_id"])).fetchone()
                 else:
-                    row = people._conn.execute("SELECT * FROM crm_proposals WHERE person_id=? AND proposal_id=?",
-                        (pid, args["proposal_id"])).fetchone()
+                    row = people._conn.execute("SELECT * FROM crm_proposals WHERE user_id = %s AND person_id=%s AND proposal_id=%s",
+                        (people._user_id, pid, args["proposal_id"])).fetchone()
                 if row is None:
                     raise TaskNotFound("unknown local change or proposal")
                 refs = json.loads(row["source_refs"])
@@ -684,8 +685,8 @@ def execute_crm_tool(name: str, arguments: dict, *, people: PersonStore, store: 
                 if name == "crm_undo_change":
                     undo_kind = row["entity_type"]
                 else:
-                    replay = people._conn.execute("SELECT 1 FROM crm_operations WHERE operation_id=?",
-                        (args["operation_id"],)).fetchone()
+                    replay = people._conn.execute("SELECT 1 FROM crm_operations WHERE user_id = %s AND operation_id=%s",
+                        (people._user_id, args["operation_id"])).fetchone()
                     if not replay and (args["expected_version"] != row["version"]
                             or args["expected_target_version"] != row["expected_target_version"]):
                         raise TaskConflict("This suggestion changed. Review it again.", code="crm_conflict")

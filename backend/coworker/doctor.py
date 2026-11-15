@@ -603,38 +603,6 @@ def _check_dependencies(collector: _Collector) -> tuple[Dependency, ...]:
     return tuple(found)
 
 
-def _check_links(collector: _Collector, root: Path) -> None:
-    # The sessions table is in Postgres now (slice S06), which Doctor does not
-    # read, so person-to-session bindings are not checked here.
-    people = migrations.spec_for("people_db")
-    if not store_present(root, people):
-        return
-    conn = open_readonly(store_path(root, people))
-    try:
-        tables = migrations.table_names(conn)
-        if {"events", "people"} <= tables:
-            orphans = [
-                f"event {str(row['event_id'])[:48]}"
-                for row in conn.execute(
-                    "SELECT event_id FROM events WHERE person_id NOT IN "
-                    "(SELECT person_id FROM people)"
-                )
-            ]
-            if orphans:
-                collector.add(
-                    "person.orphaned_event",
-                    people.store_id,
-                    Severity.WARN,
-                    Repair.REVIEW_REQUIRED,
-                    "Ledger events point at a person file that is gone. Person "
-                    "history is never deleted by Doctor.",
-                    count=len(orphans),
-                    detail=orphans,
-                )
-    finally:
-        conn.close()
-
-
 # --- diagnose ------------------------------------------------------------
 
 
@@ -666,8 +634,6 @@ def _scan(root: Path) -> _Scan:
                 _check_json_columns(collector, root, spec)
         elif spec.kind in (StoreKind.JSONL_DIR, StoreKind.JSONL_LOG):
             torn_tails.extend(_check_jsonl(collector, root, spec))
-    if not unreadable:
-        _check_links(collector, root)
     drift = _check_permissions(collector, root)
     dependencies = _check_dependencies(collector)
 

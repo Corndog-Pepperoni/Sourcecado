@@ -35,43 +35,15 @@ LABELS = {
     "phone": "Phone",
     "linkedin_url": "LinkedIn URL",
 }
-SCHEMA = (
-    """CREATE TABLE IF NOT EXISTS person_field_controls(
-        person_id TEXT NOT NULL REFERENCES people(person_id),field TEXT NOT NULL,
-        revision INTEGER NOT NULL DEFAULT 0 CHECK(revision>=0),protected INTEGER NOT NULL DEFAULT 0 CHECK(protected IN (0,1)),
-        source_refs TEXT NOT NULL DEFAULT '[]',reason TEXT NOT NULL DEFAULT '',updated_at TEXT NOT NULL,
-        PRIMARY KEY(person_id,field))""",
-    """CREATE TABLE IF NOT EXISTS person_correction_conflicts(
-        conflict_id TEXT PRIMARY KEY,person_id TEXT NOT NULL REFERENCES people(person_id),field TEXT NOT NULL,
-        saved_value TEXT,incoming_value TEXT,provider TEXT NOT NULL,field_revision INTEGER NOT NULL,
-        source_ref_id TEXT, fingerprint TEXT NOT NULL,state TEXT NOT NULL DEFAULT 'pending',created_at TEXT NOT NULL,
-        UNIQUE(person_id,fingerprint))""",
-)
-
-
-def add_schema(conn):
-    for sql in SCHEMA:
-        conn.execute(sql)
-
-
-def ready(people):
-    return (
-        people._conn.execute(
-            "SELECT 1 FROM sqlite_master WHERE name='person_field_controls'"
-        ).fetchone()
-        is not None
-    )
-
-
 def field_state(people, pid, field):
     person = people._conn.execute(
-        "SELECT * FROM people WHERE person_id=?", (pid,)
+        "SELECT * FROM people WHERE user_id = %s AND person_id=%s", (people._user_id, pid)
     ).fetchone()
     if person is None:
         raise TaskNotFound("Unknown person")
     row = people._conn.execute(
-        "SELECT * FROM person_field_controls WHERE person_id=? AND field=?",
-        (pid, field),
+        "SELECT * FROM person_field_controls WHERE user_id=%s AND person_id=%s AND field=%s",
+        (people._user_id, pid, field),
     ).fetchone()
     return {
         "value": person[field],
@@ -129,18 +101,16 @@ def normalize(changes):
 
 
 def projection(people, pid):
-    if not ready(people):
-        return {}, []
     controls = {
         r["field"]: {"protected": bool(r["protected"]), "revision": r["revision"]}
         for r in people._conn.execute(
-            "SELECT * FROM person_field_controls WHERE person_id=?", (pid,)
+            "SELECT * FROM person_field_controls WHERE user_id = %s AND person_id=%s", (people._user_id, pid)
         )
     }
     conflicts = []
     for row in people._conn.execute(
-        "SELECT * FROM person_correction_conflicts WHERE person_id=? AND state='pending' ORDER BY created_at,conflict_id",
-        (pid,),
+        "SELECT * FROM person_correction_conflicts WHERE user_id = %s AND person_id=%s AND state='pending' ORDER BY created_at,conflict_id",
+        (people._user_id, pid),
     ):
         if row["source_ref_id"]:
             try:
@@ -158,8 +128,6 @@ def filter_provider_fields(
     people, pid, incoming, *, provider="apollo", source_ref_id=None
 ):
     """Called under the owning person write lock; provider facts cannot grant authority."""
-    if not ready(people):
-        return dict(incoming), []
     allowed = dict(incoming)
     conflicts = []
     for field, value in incoming.items():
@@ -181,10 +149,11 @@ def filter_provider_fields(
         )
         cid = "conflict_" + uuid.uuid4().hex
         people._conn.execute(
-            """INSERT OR IGNORE INTO person_correction_conflicts
-            (conflict_id,person_id,field,saved_value,incoming_value,provider,field_revision,source_ref_id,fingerprint,created_at)
-            VALUES(?,?,?,?,?,?,?,?,?,?)""",
+            """INSERT INTO person_correction_conflicts
+            (user_id,conflict_id,person_id,field,saved_value,incoming_value,provider,field_revision,source_ref_id,fingerprint,created_at)
+            VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING""",
             (
+                people._user_id,
                 cid,
                 pid,
                 field,
@@ -220,16 +189,11 @@ class PersonCorrectionService:
         self.people = people
         self.conn = people._conn
 
-    def _check(self):
-        self.people.require_crm_schema()
-        if not ready(self.people):
-            raise TaskError("Person corrections require the backed-up CRM migration")
-
     def _duplicates(self, pid, changes):
         result = []
         for row in self.conn.execute(
-            "SELECT * FROM people WHERE person_id!=? AND deleted_at IS NULL ORDER BY person_id",
-            (pid,),
+            "SELECT * FROM people WHERE user_id = %s AND person_id!=%s AND deleted_at IS NULL ORDER BY person_id",
+            (self.people._user_id, pid),
         ):
             matches = []
             for field in ("email", "phone", "linkedin_url"):
@@ -263,7 +227,6 @@ class PersonCorrectionService:
         return result
 
     def review(self, pid, changes, expected_version, *, restoring=False):
-        self._check()
         changes = normalize(changes)
         with self.people._lock:
             person = self.people._load_person_row(pid)
@@ -344,7 +307,6 @@ class PersonCorrectionService:
             raise TaskConflict(
                 "A person correction requires the director", code="human_protected"
             )
-        self._check()
         changes = normalize(changes)
         operation = _clean_operation_id(operation_id)
         reason = _clean_reason(reason, "Director corrected person details")
@@ -378,22 +340,22 @@ class PersonCorrectionService:
             now = self.people._now()
             self.conn.execute(
                 "UPDATE people SET "
-                + ",".join(f + "=?" for f in changes)
-                + ",version=version+1,updated_at=? WHERE person_id=?",
-                (*changes.values(), now, pid),
+                + ",".join(f + "=%s" for f in changes)
+                + ",version=version+1,updated_at=%s WHERE user_id=%s AND person_id=%s",
+                (*changes.values(), now, self.people._user_id, pid),
             )
             after = {}
             for field, value in changes.items():
                 revision = before[field]["revision"] + 1
                 self.conn.execute(
-                    """INSERT INTO person_field_controls(person_id,field,revision,protected,source_refs,reason,updated_at) VALUES(?,?,?,1,?,?,?)
-                    ON CONFLICT(person_id,field) DO UPDATE SET revision=excluded.revision,protected=1,source_refs=excluded.source_refs,reason=excluded.reason,updated_at=excluded.updated_at""",
-                    (pid, field, revision, json.dumps(refs), reason, now),
+                    """INSERT INTO person_field_controls(user_id,person_id,field,revision,protected,source_refs,reason,updated_at) VALUES(%s,%s,%s,%s,1,%s,%s,%s)
+                    ON CONFLICT(user_id,person_id,field) DO UPDATE SET revision=excluded.revision,protected=1,source_refs=excluded.source_refs,reason=excluded.reason,updated_at=excluded.updated_at""",
+                    (self.people._user_id, pid, field, revision, json.dumps(refs), reason, now),
                 )
                 after[field] = field_state(self.people, pid, field)
                 self.conn.execute(
-                    "UPDATE person_correction_conflicts SET state='superseded' WHERE person_id=? AND field=? AND state='pending'",
-                    (pid, field),
+                    "UPDATE person_correction_conflicts SET state='superseded' WHERE user_id=%s AND person_id=%s AND field=%s AND state='pending'",
+                    (self.people._user_id, pid, field),
                 )
             self.people._bump_identity_revision(pid, old)
             person = self.people.get(pid)
@@ -415,8 +377,8 @@ class PersonCorrectionService:
             )
             response["person"] = person
             self.conn.execute(
-                "UPDATE crm_operations SET response_json=? WHERE operation_id=?",
-                (json.dumps(response), operation),
+                "UPDATE crm_operations SET response_json=%s WHERE user_id=%s AND operation_id=%s",
+                (json.dumps(response), self.people._user_id, operation),
             )
             return response
 
@@ -443,7 +405,6 @@ class PersonCorrectionService:
     ):
         if actor != "director" and not human_requested:
             raise TaskConflict("Undo requires the director", code="human_protected")
-        self._check()
         operation = _clean_operation_id(operation_id)
         fingerprint = _fingerprint(
             {
@@ -462,8 +423,8 @@ class PersonCorrectionService:
             if replay:
                 return crm._permitted_receipt(pid, replay, allowed_source_ids)
             row = self.conn.execute(
-                "SELECT * FROM crm_changes WHERE person_id=? AND change_id=? AND entity_type='person_details'",
-                (pid, change_id),
+                "SELECT * FROM crm_changes WHERE user_id=%s AND person_id=%s AND change_id=%s AND entity_type='person_details'",
+                (self.people._user_id, pid, change_id),
             ).fetchone()
             if not row:
                 raise TaskNotFound("Unknown person correction")
@@ -495,19 +456,20 @@ class PersonCorrectionService:
             values = {f: state["value"] for f, state in before.items()}
             self.conn.execute(
                 "UPDATE people SET "
-                + ",".join(f + "=?" for f in values)
-                + ",version=version+1,updated_at=? WHERE person_id=?",
-                (*values.values(), now, pid),
+                + ",".join(f + "=%s" for f in values)
+                + ",version=version+1,updated_at=%s WHERE user_id=%s AND person_id=%s",
+                (*values.values(), now, self.people._user_id, pid),
             )
             after = {}
             for field, state in before.items():
                 self.conn.execute(
-                    "UPDATE person_field_controls SET revision=revision+1,protected=?,source_refs=?,reason=?,updated_at=? WHERE person_id=? AND field=?",
+                    "UPDATE person_field_controls SET revision=revision+1,protected=%s,source_refs=%s,reason=%s,updated_at=%s WHERE user_id=%s AND person_id=%s AND field=%s",
                     (
                         int(state["protected"]),
                         json.dumps(state["source_refs"]),
                         reason or "Undid person correction",
                         now,
+                        self.people._user_id,
                         pid,
                         field,
                     ),
@@ -535,8 +497,8 @@ class PersonCorrectionService:
             )
             result["person"] = person
             self.conn.execute(
-                "UPDATE crm_operations SET response_json=? WHERE operation_id=?",
-                (json.dumps(result), operation),
+                "UPDATE crm_operations SET response_json=%s WHERE user_id=%s AND operation_id=%s",
+                (json.dumps(result), self.people._user_id, operation),
             )
             return result
 
@@ -630,20 +592,19 @@ def note_field_changes(
     people, pid, before, *, human=False, reason="Provider facts changed"
 ):
     """Count real later field edits, including ABA through snapshot restoration."""
-    if not ready(people):
-        return
     current = dict(people._load_person_row(pid))
     before = dict(before)
     for field in FIELDS:
         if before.get(field) == current.get(field):
             continue
         row = people._conn.execute(
-            "SELECT * FROM person_field_controls WHERE person_id=? AND field=?",
-            (pid, field),
+            "SELECT * FROM person_field_controls WHERE user_id=%s AND person_id=%s AND field=%s",
+            (people._user_id, pid, field),
         ).fetchone()
         if row or human:
             people._conn.execute(
-                """INSERT INTO person_field_controls(person_id,field,revision,protected,reason,updated_at) VALUES(?,?,1,?,?,?)
-                ON CONFLICT(person_id,field) DO UPDATE SET revision=revision+1,protected=CASE WHEN ? THEN 1 ELSE protected END,reason=excluded.reason,updated_at=excluded.updated_at""",
-                (pid, field, int(human), reason, people._now(), int(human)),
+                """INSERT INTO person_field_controls(user_id,person_id,field,revision,protected,reason,updated_at) VALUES(%s,%s,%s,1,%s,%s,%s)
+                ON CONFLICT(user_id,person_id,field) DO UPDATE SET revision=person_field_controls.revision+1,
+                protected=CASE WHEN %s THEN 1 ELSE person_field_controls.protected END,reason=excluded.reason,updated_at=excluded.updated_at""",
+                (people._user_id, pid, field, int(human), reason, people._now(), bool(human)),
             )

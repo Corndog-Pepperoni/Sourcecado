@@ -83,7 +83,6 @@ def test_evidence_and_pending_analysis_survive_restart_without_duplicates(tmp_pa
         content={"body": "A real response", "body_state": "present"}) is True
     assert mail.save_message(pid, message, direction="outbound", account=ACCOUNT,
         content={"body": "A real response", "body_state": "present"}) is False
-    people._conn.close()
     restarted = MailRepository(PersonStore(tmp_path))
     assert restarted.message(ACCOUNT, "gmail-response")["body"] == "A real response"
     analysis = restarted.analysis_state(pid)
@@ -112,7 +111,6 @@ def test_failed_check_preserves_success_and_separate_checkpoints(tmp_path):
     mail.finish_check(status="ok", account=ACCOUNT, outbound_after=None, checked_at="2026-10-12T12:00:00+00:00")
     mail.finish_check(status="partial", account=ACCOUNT, outbound_after="thread-a", checked_at="2026-10-12T12:01:00+00:00")
     mail.finish_check(status="failed", account=ACCOUNT, warning="gmail_unavailable", checked_at="2026-10-12T12:02:00+00:00")
-    people._conn.close()
     restarted = MailRepository(PersonStore(tmp_path))
     state = restarted.sync_state()
     assert state["last_success_at"] == "2026-10-12T12:00:00+00:00"
@@ -165,8 +163,7 @@ def test_collects_gmail_reply_once_and_preserves_done_tasks_and_approval(tmp_pat
     assert people.get(pid)["sequence_state"] == "done"
     assert people.mail_state(pid)["follow_up"] == {"needed": False, "reason": None}
     assert next(e for e in people.timeline(pid) if e["kind"] == "send")["payload"]["approval_id"] == "approval-ada"
-    assert people._conn.execute("SELECT state FROM person_tasks WHERE task_id = ?", (task["task"]["task_id"],)).fetchone()[0] == "open"
-    people._conn.close()
+    assert people._conn.execute("SELECT state FROM person_tasks WHERE user_id = %s AND task_id = %s", (people._user_id, task["task"]["task_id"])).fetchone()[0] == "open"
     restarted = PersonStore(tmp_path)
     replay = refresh_mail(restarted, TrackedMailReader(gmail))
     assert replay["filed"] == replay["outgoing"] == 0
@@ -216,7 +213,6 @@ def test_batched_resync_keeps_the_original_boundary_across_restart(tmp_path):
     assert first["status"] == "partial"
     assert people.reply_cursor() is None
     deliver(gmail, mid="arrived-between-batches")
-    people._conn.close()
     restarted = PersonStore(tmp_path)
     resumed = refresh_mail(restarted, TrackedMailReader(gmail), max_threads=1)
     assert resumed["status"] == "ok"
@@ -290,8 +286,8 @@ def test_message_time_wins_over_filing_order(tmp_path):
 def test_missing_outgoing_time_does_not_clear_known_incoming_reminder(tmp_path):
     people = PersonStore(tmp_path)
     pid = tracked_person(people)
-    people._conn.execute("UPDATE events SET created_at = '2025-01-01 12:00:00' WHERE kind = 'send'")
-    people._conn.commit()
+    with people.transaction():
+        people._conn.execute("UPDATE events SET created_at = '2025-01-01 12:00:00' WHERE user_id = %s AND kind = 'send'", (people._user_id,))
     mail = MailRepository(people)
     mail.save_message(pid, outgoing(id="known-reply", received_at="2026-01-01T12:00:00Z"), direction="inbound",
         account=ACCOUNT, content={"body": "Question", "body_state": "present"})
@@ -333,7 +329,7 @@ def test_body_budget_and_history_pages_are_bounded_and_replay_safe(tmp_path):
     for _ in range(4):
         refresh_mail(people, TrackedMailReader(gmail), max_history_pages=1)
     assert MailRepository(people).sync_state()["status"] == "ok"
-    assert people._conn.execute("SELECT count(*) FROM gmail_messages").fetchone()[0] == 5
+    assert people._conn.execute("SELECT count(*) FROM gmail_messages WHERE user_id = %s", (people._user_id,)).fetchone()[0] == 5
 
 
 def test_read_only_surface_and_source_cannot_reach_connector_writes():
@@ -376,7 +372,6 @@ def test_expired_history_restarts_partial_outgoing_pass_and_keeps_recovery_bound
     assert recovering["status"] == "partial"
     assert MailRepository(people).message(ACCOUNT, "archived-before-expiry")
     deliver(gmail, mid="between-recovery-batches")
-    people._conn.close()
     restarted = PersonStore(tmp_path)
     assert refresh_mail(restarted, TrackedMailReader(gmail), max_threads=1)["status"] == "ok"
     assert restarted.reply_cursor() == boundary
@@ -434,3 +429,34 @@ def test_body_with_changed_bcc_is_not_saved_under_attributed_metadata(tmp_path):
     saved = MailRepository(people).message(ACCOUNT, "incoming")
     assert saved["body"] == ""
     assert saved["body_state"] == "missing"
+
+
+def test_newly_shared_address_during_collection_never_commits_body_or_activity(
+    tmp_path,
+):
+    p = PersonStore(tmp_path)
+    pid = tracked_person(p)
+    g = mailbox()
+    deliver(g, body="Private text that must not be assigned")
+    original = g.read
+
+    def change_owner(**kwargs):
+        other = p.keep_from_apollo(
+            apollo_id="other",
+            first_name="Other",
+            last_name_obfuscated=None,
+            title="Lead",
+            company="Other",
+        )["person_id"]
+        p.apply_enrichment(other, email=ADDRESS)
+        return original(**kwargs)
+
+    g.read = change_owner
+    r = refresh_mail(p, TrackedMailReader(g))
+    assert r["unassigned"] == 1
+    assert MailRepository(p).message("director@sourcecado.test", "incoming") is None
+    assert not any(
+        e["payload"].get("message_id") == "incoming"
+        for e in p.timeline(pid)
+        if e["kind"] == "mail"
+    )

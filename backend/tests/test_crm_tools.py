@@ -248,8 +248,11 @@ def test_pre_upgrade_task_operation_replays_without_new_receipt(tmp_path):
         actor="director", operation_id="op-legacy-task")
     legacy = _fingerprint({"op": "task.create", "person_id": pid, "actor": "director",
                            "title": "Legacy", "details": "", "due_date": None})
-    people._conn.execute("UPDATE crm_operations SET fingerprint = ? WHERE operation_id = ?", (legacy, "op-legacy-task"))
-    people._conn.commit()
+    with people.transaction():
+        people._conn.execute(
+            "UPDATE crm_operations SET fingerprint = %s WHERE user_id = %s AND operation_id = %s",
+            (legacy, people._user_id, "op-legacy-task"),
+        )
     replay = TaskService(PersonStore(tmp_path)).create(pid, title="Legacy", timezone="America/Los_Angeles",
         actor="director", operation_id="op-legacy-task")
     assert replay["replayed"] and replay["change"]["change_id"] == saved["change"]["change_id"]
@@ -687,7 +690,7 @@ def test_generic_first_task_or_undo_target_requires_clarification_when_ambiguous
     results = scripted_chat(app, pid, "Undo that task completion" if undo else "Mark that task done",
         [ToolCall(id="ambiguous-target", name="crm_undo_change" if undo else "crm_update_task", arguments=args)])
     assert not results[0]["ok"] and results[0]["result"]["code"] == ("ambiguous_crm_change" if undo else "ambiguous_task")
-    assert not app.state.people._conn.execute("SELECT 1 FROM crm_operations WHERE operation_id = 'op-ambiguous-target'").fetchone()
+    assert not app.state.people._conn.execute("SELECT 1 FROM crm_operations WHERE user_id = %s AND operation_id = 'op-ambiguous-target'", (app.state.people._user_id,)).fetchone()
 
 
 def test_reads_exact_replay_and_corrected_validation_do_not_spend_extra_authority(tmp_path):

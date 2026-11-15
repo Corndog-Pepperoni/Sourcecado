@@ -173,39 +173,6 @@ def test_after_rotation_the_revoked_value_is_still_found_in_conversations_and_ev
 # --- an incomplete scan is not a clean one ----------------------------------
 
 
-def test_a_truncated_store_that_still_holds_the_value_is_not_reported_clean(
-    tmp_path, capsys
-):
-    """A store that cannot be read is not a proof the value is absent.
-
-    Public seam: scan_state / ScanReport.clean / ScanReport.render / main.
-    A garbage people.db can still contain the planted bytes. The structured
-    SQLite walk reports it unreadable. That must not print
-    'clean -- no match found' or exit 0 -- those feed the remediation receipt.
-    """
-    root = tmp_path / "state"
-    root.mkdir()
-    probe = _probe_value()
-    _write_secrets(root, {"probe": {"api_key": probe}})
-    (root / "people.db").write_bytes(
-        b"not-a-database " + probe.encode() + b" trailing-garbage"
-    )
-
-    report = scan_state(root, secret_key="probe")
-
-    assert report.unreadable == ("people_db",)
-    assert not report.clean
-    rendered = report.render()
-    assert "clean -- no match found" not in rendered
-    assert probe not in rendered
-
-    code = main(["--state", str(root), "--secret-key", "probe"])
-    captured = capsys.readouterr()
-    assert code == 2
-    assert "clean -- no match found" not in captured.out
-    assert probe not in captured.out
-
-
 @pytest.mark.parametrize(
     "dirname,store_id",
     [

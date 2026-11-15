@@ -396,11 +396,11 @@ def test_a_send_moves_an_unknown_legacy_state_out_of_backlog(tmp_path):
     app = _app(tmp_path, gmail)
     client = TestClient(app)
     person_id, session_id = _bound_person(app)
-    app.state.people._conn.execute(
-        "UPDATE people SET sequence_state = 'kept' WHERE person_id = ?",
-        (person_id,),
-    )
-    app.state.people._conn.commit()
+    with app.state.people.transaction():
+        app.state.people._conn.execute(
+            "UPDATE people SET sequence_state = 'kept' WHERE user_id = %s AND person_id = %s",
+            (app.state.people._user_id, person_id),
+        )
     draft = _draft(client, person_id, session_id)
     item_id = _park(client, person_id, session_id, draft)
 

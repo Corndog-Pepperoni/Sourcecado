@@ -147,7 +147,7 @@ from coworker.brief import (
     project,
     prompt_context,
 )
-from coworker.people import DESCRIPTION_SLOTS, SEARCH_LIMIT_DEFAULT, CrmMigrationRequired, PersonStore
+from coworker.people import DESCRIPTION_SLOTS, SEARCH_LIMIT_DEFAULT, PersonStore
 from coworker.persona import ManifestError, Persona, load_persona
 from coworker.reply_filing import InboundReader, refresh_replies
 from coworker.crm_analysis import AnalysisService, ConversationReader
@@ -2089,7 +2089,7 @@ def create_app(
     app.state.collect_tracked_mail=collect_tracked_mail
 
     def current_board():
-        with app.state.people._lock:
+        with app.state.people.transaction():
             board = app.state.people.list_board()
             attention = app.state.crm.contacts(timezone=_operator_timezone(), limit=10000, include_saved=True)["contacts"]
             by_id = {row["person_id"]: {**row, "attention_rank": rank} for rank, row in enumerate(attention)}
@@ -2601,8 +2601,6 @@ def create_app(
             return JSONResponse({"error": "expected an object with optional boolean retry"}, status_code=400)
         try:
             return await _crm_analysis().analyze(person_id, retry=payload.get("retry", False))
-        except CrmMigrationRequired as exc:
-            return JSONResponse({"error": str(exc), "code": exc.code}, status_code=409)
         except ValueError as exc:
             return JSONResponse({"error": str(exc)}, status_code=404)
 

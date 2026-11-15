@@ -1,8 +1,6 @@
 """Merge-review regressions for requested entity, deadline, and source authority."""
-import sqlite3
 import pytest
 
-from coworker import crm_tasks
 from coworker.crm_tasks import TaskService
 from coworker.people import PersonStore
 from coworker.provider import FakeProvider, ToolCall
@@ -297,6 +295,16 @@ def test_replacement_task_id_is_data_not_a_target_selector(tmp_path):
 
 
 def test_source_validation_and_new_task_commit_share_write_transaction(tmp_path, monkeypatch):
+    """A second writer of the same user waits until the task write commits.
+
+    SQLite refused the second writer with "database is locked". On Postgres the
+    second writer blocks on the user's write lock, then runs after the commit,
+    so it sees the new task and keeps the source that the task cites.
+    """
+    import threading
+
+    from coworker import crm_tasks
+
     people = PersonStore(tmp_path)
     pid = keep(people)["person_id"]
     before = people.get(pid)["version"]
@@ -304,25 +312,32 @@ def test_source_validation_and_new_task_commit_share_write_transaction(tmp_path,
         idempotency_key="merge-source", actor="director", rationale_summary="Attach evidence")
     service = TaskService(people)
     other = PersonStore(tmp_path)
-    other._conn.execute("PRAGMA busy_timeout=0")
+    assert other._user_id == people._user_id
     original = crm_tasks.source_ids
-    blocked = []
+    reverts, blocked = [], []
+
+    def revert():
+        reverts.append(other.revert(pid, to_version=before, expected_version=other.get(pid)["version"],
+                                    actor="director", rationale_summary="Revert the source attachment"))
+
     def validate(*args):
         refs = original(*args)
-        try:
-            other.revert(pid, to_version=before, expected_version=other.get(pid)["version"],
-                         actor="director", rationale_summary="Revert the source attachment")
-        except sqlite3.OperationalError as error:
-            assert "locked" in str(error)
-            blocked.append(True)
-            other._conn.rollback()
-        else:
-            blocked.append(False)
+        if not blocked:
+            thread = threading.Thread(target=revert)
+            thread.start()
+            thread.join(timeout=2)
+            # Still inside the task write: the revert must be waiting.
+            blocked.append((thread, thread.is_alive(), len(reverts)))
         return refs
+
     monkeypatch.setattr(crm_tasks, "source_ids", validate)
     saved = service.create(pid, title="Sourced promise", actor="assistant", source_refs=[source["id"]],
         operation_id="merge-source-create", timezone="America/Los_Angeles")
-    assert blocked and all(blocked)
+    monkeypatch.setattr(crm_tasks, "source_ids", original)
+    thread, waiting, finished = blocked[0]
+    assert waiting and finished == 0, "the revert ran inside the task write"
+    thread.join(timeout=30)
+    assert not thread.is_alive() and len(reverts) == 1
+    # The revert ran after the commit, so it kept the source the task cites.
     assert original(people, pid, saved["task"]["source_refs"], None) == [source["id"]]
     assert service.changes(saved["task"]["task_id"])[0]["change_id"] == saved["change"]["change_id"]
-    other._conn.close()

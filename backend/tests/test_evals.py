@@ -77,7 +77,7 @@ def test_each_environment_has_unique_credential_free_state_and_connector_fakes(
         assert first.state_dir != second.state_dir
         assert first.home_dir != second.home_dir
         assert first.store._user_id != second.store._user_id
-        assert first.people.db_path != second.people.db_path
+        assert first.people._user_id != second.people._user_id
         assert first.connectors is not second.connectors
         assert first.connectors.gmail is not second.connectors.gmail
         assert first.connectors.http is not second.connectors.http
