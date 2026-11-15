@@ -50,6 +50,18 @@ jobs:
         working-directory: backend
         run: python -m coworker.evals --suite sourcing --artifacts .eval-artifacts
 
+  container:
+    name: Backend container image
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # The hosted demo runs this image on Railway (docs/engineering/hosted-demo.md).
+      - name: Build the image
+        run: docker build -t sourcecado-backend backend
+
   gui:
     name: Desktop GUI
     runs-on: ubuntu-latest

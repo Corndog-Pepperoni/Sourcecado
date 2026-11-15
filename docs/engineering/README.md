@@ -51,6 +51,7 @@ an explicit director command and goes through the app's own writer and change hi
 
 ## Operating and packaging
 
+- [Hosted demo](hosted-demo.md) — the Railway container, Supabase sign-in, and each setting by name
 - [Postgres port rules](postgres-port.md) — for the slices that move a store from SQLite to Postgres
 - [Doctor and migrations](doctor.md)
 - [Secret scan](secret-scan.md) and [diagnostic bundles](diagnostic-bundle.md)
