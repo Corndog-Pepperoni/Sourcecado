@@ -8,7 +8,7 @@ Sourcecado is moving from a local desktop app to a hosted web service: React/Vit
 
 Chat is home. Contacts is the assistant's operating picture for saved people and their sequences. The person file is the durable domain object.
 
-The active runtime is `backend/` (Python) and `frontend/` (React; the Tauri shell stays until slice S38 removes it). The previous hosted Next.js/Postgres application is preserved in `archive/hosted-web/`. It is not the current implementation and is not the base for the hosted service.
+The active runtime is `backend/` (Python) and `frontend/` (React). The previous hosted Next.js/Postgres application is preserved in `archive/hosted-web/`. It is not the current implementation and is not the base for the hosted service.
 
 ## Current guardrails
 
@@ -29,7 +29,7 @@ The active runtime is `backend/` (Python) and `frontend/` (React; the Tauri shel
 ## Repository map
 
 - `backend/coworker/` — backend, connectors, agent loop, policy, and persistence
-- `frontend/` — active React/Vite UI; `src-tauri/` is the desktop shell, kept until slice S38
+- `frontend/` — active React/Vite UI
 - `backend/tests/` and `frontend/tests/` — active verification suites
 - `docs/` — current and historical product/engineering records
 - `docs/course/` — Sourcecado Course language and plan. Product language in `docs/domain.md` takes precedence over course terminology.

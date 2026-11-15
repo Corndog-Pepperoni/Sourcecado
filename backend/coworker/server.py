@@ -207,10 +207,8 @@ from coworker.turn import (
 _UNSET = object()
 
 _ALLOWED_ORIGIN_RE = re.compile(
-    r"^(tauri://localhost"
-    r"|https?://localhost(:\d+)?"
-    r"|https?://127\.0\.0\.1(:\d+)?"
-    r"|https?://tauri\.localhost)$"
+    r"^(https?://localhost(:\d+)?"
+    r"|https?://127\.0\.0\.1(:\d+)?)$"
 )
 
 TOKEN_HEADER = "X-Club-Token"
@@ -1236,7 +1234,6 @@ def create_app(
             "http://localhost:5173",
             "http://127.0.0.1:5180",
             "http://localhost:5180",
-            "tauri://localhost",
             *extra_origins,
         ],
         allow_credentials=True,

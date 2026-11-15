@@ -473,27 +473,6 @@ def test_the_packaged_backend_runs_the_worker_with_a_flag(monkeypatch):
     assert "--max-stream" in command and cwd is None
 
 
-def test_the_entry_point_dispatches_the_worker_flag_without_loading_the_server():
-    result = subprocess.run(
-        [
-            sys.executable,
-            str(BACKEND / "packaging" / "backend_entry.py"),
-            "--pdf-worker",
-            "--max-chars", "1000",
-            "--max-pages", "10",
-            "--max-stream", str(MB),
-            "--seconds", "5",
-        ],  # fmt: skip
-        input=pdf_bytes([["Packaged worker text"]]),
-        capture_output=True,
-        env={"PATH": os.environ["PATH"], "PYTHONPATH": str(BACKEND)},
-        timeout=30,
-    )
-
-    answer = json.loads(result.stdout)
-    assert answer["ok"] is True and "Packaged worker text" in answer["text"]
-
-
 def test_the_worker_reports_each_refusal_by_code():
     from coworker.pdf_worker import extract
 

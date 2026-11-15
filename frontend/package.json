@@ -8,14 +8,11 @@
     "build": "tsc --noEmit && vite build",
     "test": "vitest run --config vitest.config.ts --reporter=verbose",
     "test:watch": "vitest --config vitest.config.ts --reporter=verbose",
-    "preview": "vite preview",
-    "tauri": "tauri",
-    "tauri:dev": "tauri dev --config src-tauri/tauri.dev.conf.json"
+    "preview": "vite preview"
   },
   "dependencies": {
     "@assistant-ui/react": "0.15.16",
     "@supabase/supabase-js": "^2.119.0",
-    "@tauri-apps/plugin-dialog": "2.7.2",
     "highlight.js": "11.11.1",
     "lowlight": "3.3.0",
     "react": "^18.3.1",
@@ -24,7 +21,6 @@
     "remark-gfm": "4.0.1"
   },
   "devDependencies": {
-    "@tauri-apps/cli": "^2.11.2",
     "@testing-library/jest-dom": "6.6.3",
     "@testing-library/react": "16.1.0",
     "@types/hast": "3.0.5",

@@ -20,7 +20,7 @@ both require explicit approval.
 
 Read [CONTRIBUTING.md](CONTRIBUTING.md) to install dependencies, run with isolated
 development state, and make a first contribution. It covers Python 3.14, Node 24,
-and the extra tools needed for the native macOS app. You can explore the UI and
+and the tools it needs. You can explore the UI and
 run tests without live credentials.
 
 The usual commands run from the repository root:
@@ -34,16 +34,12 @@ make build        # frontend type check and bundle
 make eval-sourcing
 ```
 
-For the native window, use `make native` after stopping the separate backend and
-GUI processes. Tauri starts both itself. The [packaging guide](docs/engineering/packaging.md)
-covers building a distributable app.
-
 ## Repository layout
 
 | Path | Contents |
 | --- | --- |
-| `backend/` | Python API, agent runtime, connectors, persistence, tests and backend packaging scripts |
-| `frontend/` | React/Vite UI and tests; `src-tauri/` contains the native shell |
+| `backend/` | Python API, agent runtime, connectors, persistence and tests |
+| `frontend/` | React/Vite UI and tests |
 | `docs/` | Product and engineering references, backlog, course material and dated reviews |
 | `brand/` | Brand assets and their source files |
 | `archive/hosted-web/` | Retired Next.js/Postgres app; excluded from the active build |

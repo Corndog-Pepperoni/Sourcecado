@@ -2,14 +2,12 @@
 
 Sourcecado helps a Codeology sourcing director find people, prepare outreach, and retain useful context.
 
-The Python/FastAPI backend lives in `backend/`. The React/Vite UI and Tauri
-shell live in `frontend/`. `archive/hosted-web/` preserves the retired application.
+The Python/FastAPI backend lives in `backend/`. The React/Vite UI
+lives in `frontend/`. `archive/hosted-web/` preserves the retired application.
 
 ## Get a clean checkout running
 
-Use macOS for native development. Install Git, Python **3.14**, Node **24**,
-and npm. Native development also needs Rust via rustup and Apple's command-line
-developer tools (`xcode-select --install` if absent).
+Install Git, Python **3.14**, Node **24**, and npm.
 
 ```bash
 git clone https://github.com/FisherXZ/Sourcecado.git
@@ -28,8 +26,7 @@ earlier on your PATH. If necessary, use
 with `backend/.venv/bin/python --version`.
 
 Setup installs the hash-locked Python dependencies and runs `npm ci`. It does
-not configure credentials, migrate your normal installation, or create a
-packaged app.
+not configure credentials or migrate your normal installation.
 
 ### Start the local database
 
@@ -128,25 +125,6 @@ the external `.env`. An empty external file alone does not guarantee a
 credential-free run if a populated `backend/.env` is present. Keep credentials
 in the external state directory for predictable isolation.
 
-### Open the native window
-
-Stop the browser-development processes first. From the repo root, with the
-same `CLUB_STATE_DIR` exported:
-
-```bash
-make native
-```
-
-Tauri starts Vite and its own backend from `backend/.venv`; do not start another
-`make backend`. The `tauri:dev` script supplies `tauri.dev.conf.json`, which
-omits the frozen backend resource used only by packaged builds. Use
-`make native` or `npm --prefix frontend run tauri:dev`, rather than bare `tauri dev`.
-
-Closing the window hides it to the menu bar. Use Quit to stop the application
-and its backend. Packaged distribution is a separate workflow:
-[packaging](docs/engineering/packaging.md) and
-[preview updates](docs/engineering/update-channel.md).
-
 ## Find the code for your change
 
 Start with the [product spec](docs/superpowers/specs/2026-08-25-sourcecado-sourcing-director-spring.md)
@@ -158,7 +136,6 @@ React page → api.ts / chat transport → FastAPI server
            → turn loop → permission decision → tool / connector
            → person file + run ledger → events back to the UI
 
-Tauri owns backend startup and shutdown.
 Scheduled jobs share the turn loop.
 Approvals and crash recovery have durable state of their own.
 ```
@@ -195,9 +172,8 @@ make eval-sourcing
 ```
 
 `make test` runs Python and GUI tests. `make build` type-checks TypeScript and
-builds the browser bundle; it is not a native app build. The sourcing eval is
-also a CI gate. The macOS artifact build is available through a manual run of
-the CI workflow; it does not run on each PR or push. Python and
+builds the browser bundle. The sourcing eval is
+also a CI gate. Python and
 GUI lint/type/coverage gates are not all in place; see
 [#166](https://github.com/FisherXZ/Sourcecado/issues/166).
 
@@ -214,17 +190,6 @@ Or, from the root:
 npm --prefix frontend test -- --run tests/transport.test.ts
 ```
 
-For Rust-only development checks before a frozen backend exists:
-
-```bash
-cd frontend/src-tauri
-cargo fmt --check
-TAURI_CONFIG='{"bundle":{"resources":[]}}' cargo test --locked
-```
-
-Release checks keep the packaged-resource requirement. Follow the packaging
-guide when changing native lifecycle or distribution behavior.
-
 ## Debug a first-run problem
 
 | Symptom | Check / next action |
@@ -232,14 +197,12 @@ guide when changing native lifecycle or distribution behavior.
 | `python3.14` missing, or dependency install rejects versions | Install Python 3.14, confirm its executable, and pass `PYTHON` explicitly if necessary. A venv created by an older interpreter should be moved aside before rerunning setup. Do not edit the lockfile to accommodate the wrong Python. |
 | `.env` copy says “No such file or directory” | Create the state directory first. |
 | UI reports 401 or cannot connect | Confirm both terminals use the same state path, backend is on 8765, and no stale `VITE_CLUB_TOKEN` / `CLUB_API_TOKEN` overrides exist. Restart backend, then Vite. |
-| Port 5180 or 8765 already in use | Stop your other development instance or quit the native app. Closing its window only hides it. |
+| Port 5180 or 8765 already in use | Stop your other development instance. |
 | No model response | Configure a provider, restart, and check Settings. A successful local health response does not verify provider access. |
-| Native build says `resources/sourcecado-backend` is missing | Use `make native` for development. Packaged builds need `make build-backend` first. |
 | State or migration error | Run `make doctor` with the same `CLUB_STATE_DIR`; it is read-only. Read [Doctor](docs/engineering/doctor.md) before using repair. |
 
 Browser errors are visible in developer tools and backend terminal output.
-Native backend logs live under `$CLUB_STATE_DIR/logs/backend.log`. Diagnostic
-bundles can include private source material even after secret redaction; inspect
+Diagnostic bundles can include private source material even after secret redaction; inspect
 them before sharing. See [diagnostics](docs/engineering/diagnostic-bundle.md).
 
 To start over in development, stop the app and point `CLUB_STATE_DIR` at a new

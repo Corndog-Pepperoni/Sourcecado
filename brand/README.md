@@ -18,14 +18,4 @@ Masters for the painted owl mascot. The owl wears an avocado satchel. Personalit
 
 The GUI serves this folder at `/brand/` via `frontend/public/brand`.
 
-## Regenerating app icons
-
-From the repository root:
-
-```sh
-python3 backend/packaging/make_icon.py
-```
-
-That reads `app-icon.png` and writes `frontend/src-tauri/icons/` plus `frontend/public/favicon.png`.
-
 These JPEGs were transcoded on import (about 1.9–2.5 MB originals down to ~300–450 KB). Drop the original files in place if you still have them.

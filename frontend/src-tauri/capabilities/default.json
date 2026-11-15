@@ -1,6 +1,0 @@
-{
-  "identifier": "default",
-  "description": "Main Sourcecado window",
-  "windows": ["main"],
-  "permissions": ["core:default", "dialog:allow-open"]
-}

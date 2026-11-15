@@ -38,35 +38,6 @@ def provider_overrides(mock: bool) -> dict:
     return {"provider": FakeProvider(deltas=MOCK_REPLY)} if mock else {}
 
 
-def _exit_when_orphaned() -> None:
-    """If Tauri spawned us (`CLUB_EXIT_WITH_PARENT=1`), die when the window process dies."""
-    if os.environ.get("CLUB_EXIT_WITH_PARENT") != "1":
-        return
-    import threading
-    import time
-
-    try:
-        parent = int(os.environ.get("CLUB_PARENT_PID") or 0)
-    except ValueError:
-        parent = 0
-    parent = parent or os.getppid()
-    original_ppid = os.getppid()
-
-    def watch() -> None:
-        while True:
-            time.sleep(1.5)
-            try:
-                os.kill(parent, 0)
-            except ProcessLookupError:
-                os._exit(0)
-            except PermissionError:
-                pass
-            if os.getppid() != original_ppid:
-                os._exit(0)
-
-    threading.Thread(target=watch, daemon=True).start()
-
-
 def _write_private(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
@@ -190,7 +161,6 @@ def main(argv: list[str] | None = None) -> None:
                     traceback.print_exc()
 
         threading.Thread(target=_ticks, daemon=True).start()
-        _exit_when_orphaned()
         uvicorn.run(app, host=args.host, port=args.port)
     finally:
         if token_path is not None:
