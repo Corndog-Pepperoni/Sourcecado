@@ -159,8 +159,10 @@ const httpBase = (): string =>
   "";
 
 const apiToken = (): string =>
-  // Hosted mode: the signed-in Supabase session's access token.
-  isHosted() ? currentAccessToken() :
+  // YOUR TURN (block 3, piece 6): send the login token with every request.
+  // In hosted mode the token is `currentAccessToken()`. Put that call in
+  // place of the empty text "" on the next line.
+  isHosted() ? "" :
   window.__CLUB_API_TOKEN__ ||
   // Vite resolves development credentials in serve mode only. Reading a
   // VITE_* secret here would also embed it in the production bundle.

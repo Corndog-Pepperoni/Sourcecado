@@ -31,7 +31,11 @@ export function currentAccessToken(): string {
 }
 
 export function rememberSession(session: Session | null): void {
-  accessToken = session?.access_token ?? "";
+  // YOUR TURN (block 3, piece 6): keep the login token.
+  // Put the session's `access_token` in the variable `accessToken`.
+  // When there is no session, or no token, store the empty text "".
+  void session;
+  accessToken = "";
 }
 
 /** Remove the one-time sign-in code (and any sign-in error) from the address bar. */
@@ -44,16 +48,21 @@ export function removeCodeFromUrl(): void {
 }
 
 export async function signInWithGoogle(): Promise<void> {
-  const { error } = await authClient().auth.signInWithOAuth({
-    provider: "google",
-    options: { redirectTo: `${window.location.origin}${window.location.pathname}` },
-  });
-  if (error) throw error;
+  // YOUR TURN (block 3, piece 6): start the Google sign-in.
+  // Call `authClient().auth.signInWithOAuth` and wait for it. Give it one
+  // object with two fields:
+  //   provider: "google"
+  //   options:  { redirectTo: <this page> }
+  // "This page" is window.location.origin followed by
+  // window.location.pathname, so Google sends the person back here.
+  // The call returns an object with an `error` field. Throw it when it is set.
+  throw new Error("signInWithGoogle is not written yet (block 3, piece 6)");
 }
 
 export async function signOut(): Promise<void> {
-  accessToken = "";
-  await authClient().auth.signOut({ scope: "local" });
+  // YOUR TURN (block 3, piece 6): sign out.
+  // 1. Forget the token: set `accessToken` to "".
+  // 2. Call `authClient().auth.signOut` with { scope: "local" } and wait for it.
 }
 
 export function onAuthProblem(listener: (problem: AuthProblem) => void): () => void {
