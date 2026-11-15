@@ -62,8 +62,10 @@ export function onAuthProblem(listener: (problem: AuthProblem) => void): () => v
 }
 
 /**
- * Wrap window.fetch so a 401 or a 403 `not_invited` from the backend reaches
- * the sign-in gate, whichever of the app's many request helpers made the call.
+ * Wrap window.fetch so a 401 `sign_in_required` or a 403 `not_invited` from the
+ * backend reaches the sign-in gate, whichever of the app's many request helpers
+ * made the call. Any other 401 is left alone: some routes answer 401 when a
+ * connector is not connected, and that does not mean the person is signed out.
  * Returns a function that puts the original fetch back.
  */
 export function watchBackendResponses(): () => void {
@@ -74,13 +76,11 @@ export function watchBackendResponses(): () => void {
     const response = await original.call(window, input, init);
     const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
     if (supabaseUrl && url.startsWith(supabaseUrl)) return response;
-    if (response.status === 401) {
-      report("unauthorized");
-    } else if (response.status === 403) {
+    if (response.status === 401 || response.status === 403) {
       const body = await response.clone().json().catch(() => null);
-      if (body && typeof body === "object" && (body as { error?: unknown }).error === "not_invited") {
-        report("not_invited");
-      }
+      const error = body && typeof body === "object" ? (body as { error?: unknown }).error : null;
+      if (response.status === 401 && error === "sign_in_required") report("unauthorized");
+      if (response.status === 403 && error === "not_invited") report("not_invited");
     }
     return response;
   };

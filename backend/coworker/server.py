@@ -1224,7 +1224,10 @@ def create_app(
             if verdict == "not_invited":
                 return JSONResponse({"error": "not_invited"}, status_code=403)
             if verdict != "ok":
-                return JSONResponse({"error": "unauthorized"}, status_code=401)
+                # A code of its own. Some routes answer 401 for a connector
+                # that is not connected; the website must not read that as
+                # "signed out".
+                return JSONResponse({"error": "sign_in_required"}, status_code=401)
         elif not _tokens_match(got, app.state.token):
             return JSONResponse({"error": "unauthorized"}, status_code=401)
         return await call_next(request)

@@ -110,7 +110,8 @@ def test_no_token_is_401(hosted):
 def test_invalid_token_is_401(hosted, bad):
     response = get(hosted, bad)
     assert response.status_code == 401
-    assert response.json() == {"error": "unauthorized"}
+    # Its own code, so the website can tell it from a connector's 401.
+    assert response.json() == {"error": "sign_in_required"}
 
 
 def test_valid_token_for_an_email_not_listed_is_403_not_invited(hosted):
