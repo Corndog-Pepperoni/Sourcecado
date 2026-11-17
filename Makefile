@@ -1,21 +1,29 @@
 PYTHON ?= python3.14
 VENV := backend/.venv
 GUI := frontend
+ifeq ($(OS),Windows_NT)
+SHELL := C:/Progra~1/Git/bin/bash.exe
+VENV_BINDIR := Scripts
+else
+VENV_BINDIR := bin
+endif
+SUPABASE ?= npx --no-install supabase
 # The local Supabase database from `make db-up` (port in supabase/config.toml).
 DATABASE_URL ?= postgresql://postgres:postgres@127.0.0.1:53322/postgres
 
 .PHONY: check check-1 check-2 check-3 check-4 check-5 check-6 setup backend backend-mock gui native db-up db-reset test test-python test-gui eval eval-sourcing build doctor doctor-repair secret-scan build-backend smoke-test test-update update-status update-rollback update-manifest update-verify
 
 setup:
+	npm ci
 	$(PYTHON) -m venv $(VENV)
-	$(VENV)/bin/python -m pip install --require-hashes -r backend/requirements.lock
+	$(VENV)/$(VENV_BINDIR)/python -m pip install --require-hashes -r backend/requirements.lock
 	npm --prefix $(GUI) ci
 
 backend:
-	cd backend && DATABASE_URL="$(DATABASE_URL)" .venv/bin/python -m coworker.run
+	cd backend && DATABASE_URL="$(DATABASE_URL)" .venv/$(VENV_BINDIR)/python -m coworker.run
 
 backend-mock:
-	cd backend && DATABASE_URL="$(DATABASE_URL)" .venv/bin/python -m coworker.run --mock-provider
+	cd backend && DATABASE_URL="$(DATABASE_URL)" .venv/$(VENV_BINDIR)/python -m coworker.run --mock-provider
 
 gui:
 	npm --prefix $(GUI) run dev
@@ -24,15 +32,15 @@ native:
 	npm --prefix $(GUI) run tauri:dev
 
 db-up:
-	supabase db start
+	$(SUPABASE) db start
 
 db-reset:
-	supabase db reset
+	$(SUPABASE) db reset
 
 test: test-python test-gui
 
 test-python:
-	cd backend && .venv/bin/pytest -q
+	cd backend && .venv/$(VENV_BINDIR)/python -m pytest -q
 
 test-gui:
 	npm --prefix $(GUI) test
@@ -43,7 +51,7 @@ test-gui:
 # `make check` shows all six. Checks 1, 2, 4 and 5 need `make db-up` first.
 # Check 3 needs Docker. Do the pieces in order: a check needs the pieces before it.
 
-PIECE_TEST := cd backend && .venv/bin/pytest -q -x --tb=short
+PIECE_TEST := cd backend && .venv/$(VENV_BINDIR)/python -m pytest -q -x --tb=short
 verdict = && printf '\nPIECE $(1): PASS\n' || printf '\nPIECE $(1): NOT YET. The first failure above tells you what is wrong.\n'
 
 # Piece 1: Database.tx and _service_user in backend/coworker/db.py
@@ -72,14 +80,14 @@ check-6:
 
 check:
 	@for n in 1 2 3 4 5 6; do \
-		if $(MAKE) -s check-$$n 2>/dev/null | grep -q "^PIECE $$n: PASS"; then echo "PIECE $$n: PASS"; else echo "PIECE $$n: NOT YET"; fi; \
+		if "$(MAKE)" -s check-$$n 2>/dev/null | grep -q "^PIECE $$n: PASS"; then echo "PIECE $$n: PASS"; else echo "PIECE $$n: NOT YET"; fi; \
 	done
 
 eval:
-	cd backend && .venv/bin/python -m coworker.evals --artifacts .eval-artifacts
+	cd backend && .venv/$(VENV_BINDIR)/python -m coworker.evals --artifacts .eval-artifacts
 
 eval-sourcing:
-	cd backend && .venv/bin/python -m coworker.evals --suite sourcing --artifacts .eval-artifacts
+	cd backend && .venv/$(VENV_BINDIR)/python -m coworker.evals --suite sourcing --artifacts .eval-artifacts
 
 doctor:
 	cd backend && .venv/bin/python -m coworker.doctor
